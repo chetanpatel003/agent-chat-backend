@@ -14,6 +14,15 @@
 - `RunSkill` table — not in checkpoint 1.1's required entity list.
 - Full-text search index on `Chat.title`.
 
+## Checkpoint 1.3 — no migration
+Chat/message/credit APIs needed no schema change. One index opportunity
+surfaced (pinned-chats ordering has no covering composite index) and was
+deliberately **not** applied — queries are correct without it, just not
+optimally indexed at scale. See decisions/0008.
+`prisma.config.ts`'s runtime PrismaClient is now actually wired
+(`src/lib/prisma.ts`, checkpoint 1.2) — the "not yet written" note below
+is stale as of this checkpoint.
+
 ## Prisma CLI / Neon connectivity
 `prisma migrate dev`/`deploy` initially failed (`P1001`) against a cold Neon compute; migration was generated via `migrate diff --from-empty --to-schema` (no DB connection) and applied directly via `pg`, recorded into `_prisma_migrations` to match what `deploy` would have produced. Once compute was warm, `prisma migrate status` succeeded normally and confirmed the same state. Full writeup: decisions/0006.
 

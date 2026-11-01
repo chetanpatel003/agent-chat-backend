@@ -15,4 +15,15 @@
 
 **Coverage by checkpoint 1.2's required test list:** missing token ✓, invalid token ✓, valid authenticated user ✓, existing local user lookup ✓, local user creation ✓, concurrent local user resolution ✓ (caught a real bug — see decisions/0007), frontend-supplied user id ignored ✓, cross-user chat ownership rejection ✓, invalid Zod payloads ✓ (content blocks + pagination), valid/invalid pagination cursors ✓, message content-block validation ✓.
 
+| `pnpm typecheck` | checkpoint 1.3 | PASS |
+| `pnpm lint` | checkpoint 1.3 | PASS (no issues) |
+| `pnpm test` (Vitest) | checkpoint 1.3 | **PASS — 63/63** (10 files: +5 new — services chat/message/credits, routes chats/[chatId]) |
+| Real HTTP smoke test (dev server) | checkpoint 1.3 | PASS — all 7 new routes resolve correctly (401 with no token, not 404), including the nested dynamic segment `/chats/[chatId]/messages` |
+
+**Coverage by checkpoint 1.3's required test list:**
+- Chat: create ✓, list ✓, deterministic pagination ✓ (explicit tie-timestamp test + no-gaps/no-duplicates across pages), retrieve ✓, update title ✓, pin/unpin ✓, soft-delete ✓, deleted-chat retrieval ✓ (404, same as owner.ts pattern), search titles ✓, search messages ✓, cross-user access rejection ✓ (service-level + one route-level test proving identical 404 body for "someone else's" vs "never existed").
+- Messages: first page ✓, older-page cursor ✓, stable ordering on a real timestamp tie ✓, empty history ✓, cross-user access rejection ✓, invalid cursor ✓.
+- Credits: balance retrieval ✓ (no-account=0, real account, cross-user isolation), ledger pagination ✓, cross-user access rejection ✓ (isolation, since there's no separate resource id to probe).
+- General: missing/invalid auth ✓, invalid request parameters ✓ (out-of-range limit, empty-string title), consistent error responses ✓, no sensitive internals leaked ✓ (asserted no stack-trace pattern in two response bodies).
+
 Update this table (don't narrate) after each phase's test step.

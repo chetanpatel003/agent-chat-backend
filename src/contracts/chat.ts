@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { cursorPaginationResponse } from "./pagination";
+import { CursorPaginationRequestSchema, cursorPaginationResponse } from "./pagination";
 
 export const CreateChatRequestSchema = z.object({
   title: z.string().trim().min(1).max(200).optional(),
@@ -28,3 +28,11 @@ export type ChatResponse = z.infer<typeof ChatResponseSchema>;
 
 export const ChatListResponseSchema = cursorPaginationResponse(ChatResponseSchema);
 export type ChatListResponse = z.infer<typeof ChatListResponseSchema>;
+
+// `q` doubles the list endpoint as search — same cursor/ordering
+// mechanics either way, so there's one response shape and one query
+// contract rather than a parallel "search chats" endpoint.
+export const ListChatsQuerySchema = CursorPaginationRequestSchema.extend({
+  q: z.string().trim().min(1).max(200).optional(),
+});
+export type ListChatsQuery = z.infer<typeof ListChatsQuerySchema>;

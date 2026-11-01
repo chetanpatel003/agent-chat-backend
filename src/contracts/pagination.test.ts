@@ -8,7 +8,7 @@ import {
 
 describe("cursor pagination", () => {
   it("round-trips a valid cursor", () => {
-    const payload = { createdAt: new Date().toISOString(), id: randomUUID() };
+    const payload = { sortKey: new Date().toISOString(), id: randomUUID() };
     const cursor = encodeCursor(payload);
     const decoded = decodeCursor(cursor);
     expect(decoded).toEqual(payload);
@@ -27,7 +27,7 @@ describe("cursor pagination", () => {
 
   it("rejects a cursor whose id isn't a uuid", () => {
     const bogus = Buffer.from(
-      JSON.stringify({ createdAt: new Date().toISOString(), id: "not-a-uuid" }),
+      JSON.stringify({ sortKey: new Date().toISOString(), id: "not-a-uuid" }),
     ).toString("base64url");
     expect(decodeCursor(bogus)).toBeNull();
   });

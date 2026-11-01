@@ -1,3 +1,4 @@
+import { ZodError } from "zod";
 import type { ErrorResponse } from "@/contracts/common";
 
 /** Missing or invalid bearer token. Always maps to 401. */
@@ -41,6 +42,24 @@ export function toErrorResponse(error: unknown): {
   status: number;
   body: ErrorResponse;
 } {
+  // A raw ZodError (every route's `.parse()` call on a body/query throws
+  // this directly — there's no reason to wrap each one in a try/catch
+  // that rethrows ValidationError) maps to 400. The per-field issue list
+  // is safe, actionable feedback the client needs — "title: too short" is
+  // not an internal detail — unlike a stack trace or driver error.
+  if (error instanceof ZodError) {
+    const issues = error.issues
+      .map((issue) => `${issue.path.join(".") || "(body)"}: ${issue.message}`)
+      .join("; ");
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: { code: "ValidationError", message: issues || "Invalid request" },
+      },
+    };
+  }
+
   if (error instanceof Error && error.name in STATUS_BY_ERROR_NAME) {
     return {
       status: STATUS_BY_ERROR_NAME[error.name],

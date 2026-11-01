@@ -922,3 +922,88 @@ checkpoint 1.1 and are the only columns used.
 present in `.env.example` from the original project setup (same as
 `OPENROUTER_API_KEY`/`OPENROUTER_MODEL` were); no `.env.example` change
 needed this checkpoint.
+
+## Real Magica tools and end-to-end execution (checkpoint 3.3)
+
+All three required Magica tools — Crop Image, GPT Image 2 (both its
+text-to-image and image-editing sub-models), Merge Videos — are now
+registered in `PRODUCTION_TOOL_REGISTRY` (`src/tools/registry.ts`),
+exposed to real conversations for the first time. All four tools
+(`generate_image`, `edit_image`, `crop_image`, `merge_videos`) are
+built on the exact same `createMagicaTool` factory
+(`src/tools/magica-tools.ts`) — one place the start/persist/poll/
+reconcile sequence lives, reusing checkpoint 3.2's provider adapter
+and recovery plumbing unchanged. No new abstraction was introduced to
+add the three: each is a `nodeType`/`subModelId`/input-schema triple
+passed to the same factory.
+
+**Built and proved incrementally, per this checkpoint's own
+instruction:** `generate_image` was implemented first and
+live-verified against the real Magica API (one real, controlled call —
+see "Live verification" below and
+`project-docs/magica/LIVE_VERIFICATION.md`) before the other three
+were added. That one live call surfaced a real, non-obvious bug (see
+below), fixed before the remaining tools were built on top of the same
+(now-corrected) output-normalization code. `edit_image`, `crop_image`,
+and `merge_videos` were **not** independently live-verified — not
+required once the shared mechanism was already proven for real; their
+output shapes are therefore validated by mocked tests only, against
+the documented (not live-confirmed) response shape for each `nodeType`.
+
+### Tool contracts
+
+| Tool | `nodeType` | `subModelId` | Required input | Notes |
+|---|---|---|---|---|
+| `generate_image` | `gpt_image_2` | `gpt-image-2-text` | `prompt` (1–4000 chars) | Text-to-image only; does not accept an existing image |
+| `edit_image` | `gpt_image_2` | `gpt-image-2-edit` | `prompt` (1–4000 chars), `uploadedImages` (1–10 public HTTPS URLs) | Never silently falls back to text-to-image if `uploadedImages` is missing/invalid — rejected by the input schema instead |
+| `crop_image` | `crop_image` | none | `image_url` (public HTTPS URL) | Percentage (`x_percent`/`y_percent`/`width_percent`/`height_percent`, 0–100) and pixel (`x_px`/`y_px`/`width_px`/`height_px`, non-negative integers) crop fields are both accepted, independently — the discovered schema documents no mutual-exclusivity rule, so none is invented |
+| `merge_videos` | `merge_videos` | none | `video_urls` (2–100 public HTTPS URLs) | The 2-video minimum is enforced here in application validation — Magica's own schema states it only in a field description, not as a machine-checked constraint. Optional `transition`: `none`\|`fade`\|`dissolve`. No duration/codec/other field is invented — none is documented |
+
+`generate_image` and `edit_image` share the same optional fields
+(`size`, `quality`, `background`, `n`, `output_format`) via
+`GptImage2CommonFields`, exactly the fields discovered and schema-
+tested in checkpoint 3.3's own `gpt-image-2-text` investigation —
+unchanged from checkpoint 3.2's draft. `PublicHttpsUrlSchema` (a
+`z.string().url()` refined to require `https://`) is shared by
+`edit_image`, `crop_image`, and `merge_videos` for every URL field —
+Magica's media inputs are documented as public URLs it fetches itself,
+not uploads through this backend.
+
+### Live verification — `generate_image` only
+
+One real, controlled, `quality: "Low"` call via a temporary Trigger.dev
+diagnostic task (created once, used once, deleted immediately after —
+never committed). Full detail, including the exact raw response JSON
+and the `curl -I` fetchability check, is in
+`project-docs/magica/LIVE_VERIFICATION.md`. Summary:
+
+- Accepted (`202`), `providerRunId` persisted, polling reached
+  `COMPLETED` in 39.4s.
+- **The real output shape diverged from the one documented example**:
+  `{result: [url], provider, creditUsed, resultMetadata}`, not
+  `{images: [...]}` as the only prior documented example (an unrelated
+  model, `nano_banana_pro`) suggested. `extractImageUrls()` in
+  `magica-tools.ts` was corrected to check `result` first (now
+  confirmed real for this model), falling back to `images` (still
+  unverified, kept only in case some other node actually uses it).
+- The resulting URL was independently confirmed publicly fetchable
+  (`curl -I` → `200`, `image/png`, `content-length` exactly matching
+  `resultMetadata[0].size`), with no auth required.
+- `creditUsed` (`8385` for this call) is captured and persisted only
+  as descriptive JSON inside the tool's own output — never written to
+  `ToolInvocation.creditsCharged` or any `CreditLedger` row, per this
+  checkpoint's explicit restriction against settling credits yet. The
+  credit-estimation pricing-unit discrepancy
+  (`project-docs/magica/CREDIT_ESTIMATION.md`) is **not resolved** by
+  this call — it adds one data point plus a new complicating factor
+  (the real output resolution, 1313×1198, matched no documented size
+  preset despite `size` being left at `"Auto"`).
+
+### What was explicitly not done, per this checkpoint's own scope
+
+No credit deduction or ledger settlement for any Magica tool call; no
+new Prisma model or migration; no claim that a Magica run can be
+cancelled via its own webhook (polling + local-cancellation-check
+only, unchanged from checkpoint 3.2); no automatic retry of an
+ambiguous start; no Transloadit integration or redesign; no generic
+workflow/orchestration engine beyond the one shared factory.

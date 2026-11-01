@@ -15,7 +15,7 @@ import { startMagicaRun, getMagicaRun } from "@/providers/magica";
 import { prisma } from "@/lib/prisma";
 import { makeTestUser, cleanupTestUsers } from "@/test-utils/db-fixtures";
 import { createToolRegistry, toOpenRouterTools, PRODUCTION_TOOL_REGISTRY } from "./registry";
-import { generateImageTool } from "./magica-tools";
+import { generateImageTool, editImageTool, cropImageTool, mergeVideosTool } from "./magica-tools";
 import { executeAgentTurn } from "@/trigger/run-agent-turn";
 import type { PublishRunEvent } from "@/realtime/publish-run-event";
 
@@ -277,7 +277,7 @@ describe("generate_image — reconciliation on re-entry", () => {
       data: { chatId: chat.id, userId: owner.id, agentRunId: run.id, role: "ASSISTANT", status: "PENDING", content: [] },
     });
     const stale = await prisma.toolInvocation.create({
-      data: { agentRunId: run.id, toolName: "generate_image", idempotencyKey: randomUUID(), input: {}, status: "RUNNING", providerRunId: "magica_run_reentry" },
+      data: { agentRunId: run.id, toolName: "generate_image", idempotencyKey: randomUUID(), input: {}, status: "RUNNING", providerRunId: `magica_run_reentry_${randomUUID()}` },
     });
     await prisma.$executeRaw`UPDATE "AgentRun" SET "updatedAt" = ${new Date(Date.now() - 5 * 60_000)} WHERE "id" = ${run.id}::uuid`;
 
@@ -290,5 +290,284 @@ describe("generate_image — reconciliation on re-entry", () => {
     const updated = await prisma.toolInvocation.findUniqueOrThrow({ where: { id: stale.id } });
     expect(updated.status).toBe("COMPLETED");
     expect(updated.output).toEqual({ raw: { images: ["https://cdn.example.com/recovered.png"] }, images: ["https://cdn.example.com/recovered.png"] });
+  });
+});
+
+// The shared start/persist/poll/reconcile mechanism (createMagicaTool)
+// is already exhaustively covered above via generate_image. The
+// following three tools reuse that exact factory, so their own tests
+// focus on what's actually new per tool: input validation against
+// each real discovered schema, registration, and one through-the-loop
+// test confirming correct nodeType/subModelId wiring and input
+// passthrough.
+
+describe("edit_image — input validation (real discovered gpt-image-2-edit schema)", () => {
+  it("accepts a minimal valid input (prompt + one uploaded image)", () => {
+    expect(
+      editImageTool.inputSchema.safeParse({ prompt: "make it blue", uploadedImages: ["https://cdn.example.com/a.png"] }).success,
+    ).toBe(true);
+  });
+
+  it("accepts up to 10 uploaded images", () => {
+    const uploadedImages = Array.from({ length: 10 }, (_, i) => `https://cdn.example.com/${i}.png`);
+    expect(editImageTool.inputSchema.safeParse({ prompt: "x", uploadedImages }).success).toBe(true);
+  });
+
+  it("rejects 11 uploaded images", () => {
+    const uploadedImages = Array.from({ length: 11 }, (_, i) => `https://cdn.example.com/${i}.png`);
+    expect(editImageTool.inputSchema.safeParse({ prompt: "x", uploadedImages }).success).toBe(false);
+  });
+
+  it("rejects a missing uploadedImages field — never silently falls back to text-to-image", () => {
+    expect(editImageTool.inputSchema.safeParse({ prompt: "x" }).success).toBe(false);
+  });
+
+  it("rejects an empty uploadedImages array", () => {
+    expect(editImageTool.inputSchema.safeParse({ prompt: "x", uploadedImages: [] }).success).toBe(false);
+  });
+
+  it("rejects a non-HTTPS uploaded image URL", () => {
+    expect(editImageTool.inputSchema.safeParse({ prompt: "x", uploadedImages: ["http://cdn.example.com/a.png"] }).success).toBe(
+      false,
+    );
+  });
+
+  it("rejects an empty prompt", () => {
+    expect(editImageTool.inputSchema.safeParse({ prompt: "", uploadedImages: ["https://cdn.example.com/a.png"] }).success).toBe(
+      false,
+    );
+  });
+
+  it("accepts the same optional size/quality/background/n/output_format fields as generate_image", () => {
+    expect(
+      editImageTool.inputSchema.safeParse({
+        prompt: "x",
+        uploadedImages: ["https://cdn.example.com/a.png"],
+        size: "1024x1024",
+        quality: "High",
+        background: "Auto",
+        n: 1,
+        output_format: "PNG",
+      }).success,
+    ).toBe(true);
+  });
+});
+
+describe("edit_image — registration and through the real agent loop", () => {
+  it("is registered in PRODUCTION_TOOL_REGISTRY", () => {
+    expect(PRODUCTION_TOOL_REGISTRY.get("edit_image")).toBe(editImageTool);
+  });
+
+  it("generates an OpenRouter tool schema requiring prompt and uploadedImages", () => {
+    const spec = toOpenRouterTools(PRODUCTION_TOOL_REGISTRY).find((s) => s.function.name === "edit_image");
+    expect(spec).toBeDefined();
+    expect(spec!.function.parameters).toMatchObject({ type: "object", required: ["prompt", "uploadedImages"] });
+  });
+
+  it("starts with nodeType gpt_image_2 and subModelId gpt-image-2-edit, and completes with normalized output", async () => {
+    const owner = await user("editimg-happy-path");
+    const { run } = await setUpRun(owner);
+    const input = { prompt: "make it blue", uploadedImages: ["https://cdn.example.com/a.png"] };
+    const call = toolCall("edit_image", input);
+
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    mockStartMagicaRun.mockResolvedValueOnce({ runId: "magica_run_edit_1" });
+    mockGetMagicaRun.mockResolvedValueOnce(pollResult({ status: "COMPLETED", output: { result: ["https://cdn.example.com/out.png"] } }));
+
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([editImageTool]), noopPublish);
+    expect(result.status).toBe("COMPLETED");
+    expect(mockStartMagicaRun).toHaveBeenCalledWith("gpt_image_2", input, "gpt-image-2-edit");
+
+    const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
+    expect(invocation.status).toBe("COMPLETED");
+    expect(invocation.output).toMatchObject({ images: ["https://cdn.example.com/out.png"] });
+  });
+});
+
+describe("crop_image — input validation (real discovered schema)", () => {
+  it("accepts a minimal valid input (image_url only)", () => {
+    expect(cropImageTool.inputSchema.safeParse({ image_url: "https://cdn.example.com/a.png" }).success).toBe(true);
+  });
+
+  it("accepts percentage-based crop parameters", () => {
+    expect(
+      cropImageTool.inputSchema.safeParse({
+        image_url: "https://cdn.example.com/a.png",
+        x_percent: 10,
+        y_percent: 20,
+        width_percent: 50,
+        height_percent: 50,
+      }).success,
+    ).toBe(true);
+  });
+
+  it("accepts pixel-based crop parameters", () => {
+    expect(
+      cropImageTool.inputSchema.safeParse({
+        image_url: "https://cdn.example.com/a.png",
+        x_px: 10,
+        y_px: 20,
+        width_px: 500,
+        height_px: 500,
+      }).success,
+    ).toBe(true);
+  });
+
+  it("rejects a missing image_url", () => {
+    expect(cropImageTool.inputSchema.safeParse({ width_px: 100 }).success).toBe(false);
+  });
+
+  it("rejects a non-HTTPS image_url", () => {
+    expect(cropImageTool.inputSchema.safeParse({ image_url: "http://cdn.example.com/a.png" }).success).toBe(false);
+  });
+
+  it("rejects a percent value over 100", () => {
+    expect(cropImageTool.inputSchema.safeParse({ image_url: "https://cdn.example.com/a.png", width_percent: 150 }).success).toBe(
+      false,
+    );
+  });
+
+  it("rejects a negative percent value", () => {
+    expect(cropImageTool.inputSchema.safeParse({ image_url: "https://cdn.example.com/a.png", x_percent: -5 }).success).toBe(false);
+  });
+
+  it("rejects a non-integer pixel value", () => {
+    expect(cropImageTool.inputSchema.safeParse({ image_url: "https://cdn.example.com/a.png", width_px: 100.5 }).success).toBe(
+      false,
+    );
+  });
+
+  it("rejects a zero width_px (preserves the documented minimum of 1 pixel)", () => {
+    expect(cropImageTool.inputSchema.safeParse({ image_url: "https://cdn.example.com/a.png", width_px: 0 }).success).toBe(false);
+  });
+});
+
+describe("crop_image — registration and through the real agent loop", () => {
+  it("is registered in PRODUCTION_TOOL_REGISTRY", () => {
+    expect(PRODUCTION_TOOL_REGISTRY.get("crop_image")).toBe(cropImageTool);
+  });
+
+  it("generates an OpenRouter tool schema requiring only image_url", () => {
+    const spec = toOpenRouterTools(PRODUCTION_TOOL_REGISTRY).find((s) => s.function.name === "crop_image");
+    expect(spec).toBeDefined();
+    expect(spec!.function.parameters).toMatchObject({ type: "object", required: ["image_url"] });
+  });
+
+  it("starts with nodeType crop_image and no subModelId, and completes with normalized output", async () => {
+    const owner = await user("cropimg-happy-path");
+    const { run } = await setUpRun(owner);
+    const input = { image_url: "https://cdn.example.com/a.png", width_px: 500, height_px: 500 };
+    const call = toolCall("crop_image", input);
+
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    mockStartMagicaRun.mockResolvedValueOnce({ runId: "magica_run_crop_1" });
+    mockGetMagicaRun.mockResolvedValueOnce(pollResult({ status: "COMPLETED", output: { result: ["https://cdn.example.com/cropped.png"] } }));
+
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([cropImageTool]), noopPublish);
+    expect(result.status).toBe("COMPLETED");
+    expect(mockStartMagicaRun).toHaveBeenCalledWith("crop_image", input, undefined);
+
+    const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
+    expect(invocation.status).toBe("COMPLETED");
+    expect(invocation.output).toMatchObject({ images: ["https://cdn.example.com/cropped.png"] });
+  });
+});
+
+describe("merge_videos — input validation (real discovered schema)", () => {
+  it("accepts a minimal valid input (two video URLs)", () => {
+    expect(
+      mergeVideosTool.inputSchema.safeParse({
+        video_urls: ["https://cdn.example.com/a.mp4", "https://cdn.example.com/b.mp4"],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("accepts up to 100 video URLs", () => {
+    const video_urls = Array.from({ length: 100 }, (_, i) => `https://cdn.example.com/${i}.mp4`);
+    expect(mergeVideosTool.inputSchema.safeParse({ video_urls }).success).toBe(true);
+  });
+
+  it("rejects 101 video URLs", () => {
+    const video_urls = Array.from({ length: 101 }, (_, i) => `https://cdn.example.com/${i}.mp4`);
+    expect(mergeVideosTool.inputSchema.safeParse({ video_urls }).success).toBe(false);
+  });
+
+  it("rejects a single video URL — enforces the documented minimum of two in application validation", () => {
+    expect(mergeVideosTool.inputSchema.safeParse({ video_urls: ["https://cdn.example.com/a.mp4"] }).success).toBe(false);
+  });
+
+  it("rejects an empty video_urls array", () => {
+    expect(mergeVideosTool.inputSchema.safeParse({ video_urls: [] }).success).toBe(false);
+  });
+
+  it("rejects a non-HTTPS video URL", () => {
+    expect(
+      mergeVideosTool.inputSchema.safeParse({
+        video_urls: ["http://cdn.example.com/a.mp4", "https://cdn.example.com/b.mp4"],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("accepts an optional transition value", () => {
+    expect(
+      mergeVideosTool.inputSchema.safeParse({
+        video_urls: ["https://cdn.example.com/a.mp4", "https://cdn.example.com/b.mp4"],
+        transition: "fade",
+      }).success,
+    ).toBe(true);
+  });
+
+  it("rejects an unsupported transition value", () => {
+    expect(
+      mergeVideosTool.inputSchema.safeParse({
+        video_urls: ["https://cdn.example.com/a.mp4", "https://cdn.example.com/b.mp4"],
+        transition: "wipe",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("does not accept an invented duration or codec field as part of the typed schema", () => {
+    const parsed = mergeVideosTool.inputSchema.safeParse({
+      video_urls: ["https://cdn.example.com/a.mp4", "https://cdn.example.com/b.mp4"],
+      duration: 10,
+    });
+    // Zod's default object parsing strips unknown keys rather than
+    // rejecting them; assert the unknown key never survives into the
+    // parsed value, since no duration field is defined anywhere here.
+    expect(parsed.success && !("duration" in parsed.data)).toBe(true);
+  });
+});
+
+describe("merge_videos — registration and through the real agent loop", () => {
+  it("is registered in PRODUCTION_TOOL_REGISTRY", () => {
+    expect(PRODUCTION_TOOL_REGISTRY.get("merge_videos")).toBe(mergeVideosTool);
+  });
+
+  it("generates an OpenRouter tool schema requiring only video_urls", () => {
+    const spec = toOpenRouterTools(PRODUCTION_TOOL_REGISTRY).find((s) => s.function.name === "merge_videos");
+    expect(spec).toBeDefined();
+    expect(spec!.function.parameters).toMatchObject({ type: "object", required: ["video_urls"] });
+  });
+
+  it("starts with nodeType merge_videos and no subModelId, and completes with normalized output", async () => {
+    const owner = await user("mergevid-happy-path");
+    const { run } = await setUpRun(owner);
+    const input = { video_urls: ["https://cdn.example.com/a.mp4", "https://cdn.example.com/b.mp4"], transition: "fade" as const };
+    const call = toolCall("merge_videos", input);
+
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    mockStartMagicaRun.mockResolvedValueOnce({ runId: "magica_run_merge_1" });
+    mockGetMagicaRun.mockResolvedValueOnce(pollResult({ status: "COMPLETED", output: { result: ["https://cdn.example.com/merged.mp4"] } }));
+
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([mergeVideosTool]), noopPublish);
+    expect(result.status).toBe("COMPLETED");
+    expect(mockStartMagicaRun).toHaveBeenCalledWith("merge_videos", input, undefined);
+
+    const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
+    expect(invocation.status).toBe("COMPLETED");
+    expect(invocation.output).toMatchObject({ images: ["https://cdn.example.com/merged.mp4"] });
   });
 });

@@ -18,14 +18,20 @@ function makeTool(name: string): ToolDefinition<{ x: string }, { y: string }> {
 describe("PRODUCTION_TOOL_REGISTRY", () => {
   // Decision A kept this empty through checkpoint 2.4. Checkpoint 2.5
   // amended it with the two local-only skill tools. Checkpoint 3.3
-  // adds the first real, credit-consuming Magica tool, generate_image
-  // — live-verified, staged deliberately ahead of
-  // edit_image/crop_image/merge_videos (not yet built) — see
+  // adds all three required Magica tools — generate_image (live-
+  // verified), edit_image, crop_image, merge_videos — see
   // src/tools/skills.test.ts and src/tools/magica-tools.test.ts for
   // each tool's own behavior.
-  it("contains exactly the skill tools plus generate_image — nothing else yet", () => {
-    expect(PRODUCTION_TOOL_REGISTRY.size).toBe(3);
-    expect([...PRODUCTION_TOOL_REGISTRY.keys()].sort()).toEqual(["generate_image", "load_skill", "read_skill_asset"]);
+  it("contains exactly the skill tools plus all four Magica tools", () => {
+    expect(PRODUCTION_TOOL_REGISTRY.size).toBe(6);
+    expect([...PRODUCTION_TOOL_REGISTRY.keys()].sort()).toEqual([
+      "crop_image",
+      "edit_image",
+      "generate_image",
+      "load_skill",
+      "merge_videos",
+      "read_skill_asset",
+    ]);
   });
 });
 

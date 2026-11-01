@@ -396,4 +396,99 @@ own precedent), not by papering over the leak.
 7. Tests ✓ — 47 new, all passing; mocked throughout, no live Magica or
    OpenRouter call made.
 
+| `pnpm typecheck` | checkpoint 3.3 | PASS |
+| `pnpm lint` | checkpoint 3.3 | PASS (no issues) |
+| `pnpm test` (Vitest) | checkpoint 3.3 | **318 tests total (+56 new since 3.2).** Full-suite run: 316/318 passing. Isolated re-run of just the files touched/affected by a real bug found this checkpoint (see below): 317/318 passing — only the pre-existing checkpoint-2.4 "cancelling while the provider call is active" flake remained. |
+| `pnpm build` (production) | checkpoint 3.3 | not re-run this checkpoint (no route/UI changes — backend-internal tool registration only); last confirmed PASS at checkpoint 2.2 and unaffected by anything since |
+| Live Magica connectivity | checkpoint 3.3 | **1 real, controlled call** (`generate_image`, `quality: "Low"`) — see "Live verification" below. No further live Magica or OpenRouter calls were made; every other test mocks `@/providers/magica`. |
+
+**Two known, pre-existing environmental flakes reproduced during this
+checkpoint's full-suite runs — neither caused by anything added here:**
+1. `run-agent-turn.test.ts`'s "cancelling while the provider call is
+   active" — the same intermittent Neon-latency flake first diagnosed
+   at checkpoint 2.4, reproduced identically (a trivial `beforeEach`
+   hook exceeding its 45s timeout, not a logic failure). Documented in
+   `PROJECT_STATE.md` since 2.4; unrelated to this checkpoint's scope.
+2. `send-turn.test.ts`'s real end-to-end dispatch — timed out on its
+   20s budget once, under the full 28-file/318-test parallel suite,
+   but passed cleanly on an isolated re-run of the same file with the
+   real Trigger.dev dev worker (confirmed via the worker's own log: the
+   dispatch completed in ~10s, just outside the one test's 20s window
+   when queued behind the rest of the full suite). Consistent with the
+   pre-existing documented precondition ("`pnpm trigger:dev` must be
+   running, or this test times out") plus ordinary parallel-run
+   contention — not a regression from registering the new tools.
+
+**A real, reproducible cross-file test bug found and fixed this
+checkpoint, not assumed benign:** `src/tools/magica-tools.test.ts`
+(written during the `generate_image` milestone) and
+`src/trigger/run-agent-turn.magica.test.ts` (checkpoint 3.2) both used
+the identical literal `providerRunId: "magica_run_reentry"` for
+different `ToolInvocation` rows. `ToolInvocation.providerRunId` is
+globally `@unique`, so the two files collided whenever both ran in the
+same suite invocation — exactly the same bug category checkpoint 3.2
+already found and fixed once inside a single file
+(`magica-run.test.ts`'s `"magica_run_abc"` collision), recurring here
+across two files instead. Confirmed by reading the actual Prisma
+`P2002` error (not assumed), fixed by suffixing both literals with a
+fresh `randomUUID()` per test run.
+
+**New tests by file (checkpoint 3.3):** `src/tools/magica-tools.test.ts`
++56 total — the 21 from the `generate_image` milestone (input
+validation against the real discovered `gpt-image-2-text` schema;
+registration/OpenRouter-schema-generation; full lifecycle through the
+real loop: happy path, real-output-shape extraction, no-images-field
+preservation, ambiguous-start-never-resubmits, provider-terminal-
+failure, persistence-failure-never-retries, reconciliation-on-re-entry)
+plus 35 new for `edit_image`/`crop_image`/`merge_videos` (input
+validation against each tool's own real discovered schema —
+including the `edit_image` "never silently falls back to text-to-image"
+case, the `crop_image` percent/pixel-field independence, and the
+`merge_videos` application-enforced 2-video minimum and no-invented-
+duration-field case — registration, OpenRouter schema generation, and
+one through-the-real-loop happy-path test per tool proving correct
+`nodeType`/`subModelId` wiring and output normalization). The shared
+start/persist/poll/reconcile mechanism itself (`createMagicaTool`) is
+not re-tested per tool — it's already exhaustively covered by
+`generate_image`'s own tests and unchanged for the other three.
+`src/tools/registry.test.ts` — no new tests, one existing assertion
+updated (6 tools, not 3).
+
+## Live verification — `generate_image` only (checkpoint 3.3)
+One real, controlled, `quality: "Low"` call via a temporary Trigger.dev
+diagnostic task (created once, used once, deleted immediately after,
+never committed). Full detail: `project-docs/magica/LIVE_VERIFICATION.md`,
+decisions/0013. Summary: accepted (`202`), `providerRunId` persisted,
+polled to `COMPLETED` in 39.4s, output URL independently confirmed
+publicly fetchable (`curl -I` → `200`, `image/png`, matching
+`content-length`). Found and fixed a real bug: the only previously
+documented output shape (`{images: [...]}`, an unrelated model) does
+not hold for `gpt-image-2-text` — the real shape is `{result: [url],
+provider, creditUsed, resultMetadata}`. `creditUsed` (`8385`) is
+descriptive-only, never settled to any ledger; the pre-existing
+credit-estimation pricing-unit discrepancy remains unresolved, with one
+new data point and one new complicating factor (actual output
+resolution matched no documented size preset). `edit_image`/
+`crop_image`/`merge_videos` were not independently live-verified.
+
+**Coverage by this checkpoint's required scope:**
+1. All three required Magica tools registered ✓ — `crop_image`,
+   `gpt_image_2` (both `generate_image`/text and `edit_image`/edit
+   sub-models), `merge_videos`, all via one shared factory.
+2. Incremental build-and-prove-first ✓ — `generate_image` built and
+   live-verified before the other three; the live call's own finding
+   (the real output shape) was fixed before the remaining tools were
+   built on the corrected code.
+3. Mandatory live verification ✓ — one real, controlled Magica call,
+   evidence captured and documented, clearly separated from every
+   mocked test.
+4. No credit settlement ✓ — `creditUsed` captured as descriptive JSON
+   only; nothing written to `creditsCharged` or any `CreditLedger` row.
+5. No scope overreach ✓ — no new Prisma model/migration, no webhook-
+   based cancellation claim, no automatic retry of an ambiguous start,
+   no Transloadit change, no generic workflow engine; no invented
+   `merge_videos` duration/codec field.
+6. Tests ✓ — 56 total for the four tools (35 new this session), all
+   passing; mocked throughout except the one documented live call.
+
 Update this table (don't narrate) after each phase's test step.

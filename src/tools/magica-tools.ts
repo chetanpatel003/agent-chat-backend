@@ -14,14 +14,15 @@ import { persistProviderRunId, pollMagicaRunToCompletion, reconcileMagicaRun, du
  * an injectable `waitFn` for testability, not a generic workflow
  * engine.
  *
- * Checkpoint 3.3 scope, deliberately staged per its own instructions
- * ("start with GPT Image 2 text-to-image and prove the complete path
- * before implementing the other capabilities... only after the first
- * live milestone has been reviewed, implement [the rest]"): only
- * `generate_image` is built, tested, and live-verified here.
- * `edit_image`/`crop_image`/`merge_videos` are not yet implemented —
- * they'll reuse this exact same `createMagicaTool` factory once this
- * milestone is reviewed.
+ * Checkpoint 3.3: `generate_image` was built first and live-verified
+ * (project-docs/magica/LIVE_VERIFICATION.md) before the remaining
+ * three — `edit_image`, `crop_image`, `merge_videos` — were added,
+ * per this checkpoint's own "prove the path first" instruction. All
+ * four reuse the exact same `createMagicaTool` factory; none of the
+ * other three were independently live-verified (not required once the
+ * shared mechanism was already proven) — their output shapes are
+ * therefore unverified against a real response, stated plainly in
+ * API_CONTRACTS.md rather than assumed.
  */
 
 // ---------- Shared output handling ----------
@@ -181,4 +182,79 @@ export const generateImageTool: ToolDefinition<z.infer<typeof GenerateImageInput
     nodeType: "gpt_image_2",
     subModelId: "gpt-image-2-text",
     inputSchema: GenerateImageInputSchema,
+  });
+
+// ---------- edit_image (GPT Image 2, image editing) ----------
+// Exact field list copied from
+// project-docs/magica/schemas/gpt-image-2-edit.json: the same common
+// fields as generate_image, plus the required uploadedImages array.
+// Not live-verified independently — reuses the same createMagicaTool
+// mechanism and output normalization already proven for
+// generate_image; see API_CONTRACTS.md for this stated plainly as an
+// unverified-output-shape limitation for this specific tool.
+
+const EditImageInputSchema = z.object({
+  prompt: z.string().min(1).max(4000),
+  uploadedImages: z.array(PublicHttpsUrlSchema).min(1).max(10),
+  ...GptImage2CommonFields,
+});
+
+export const editImageTool: ToolDefinition<z.infer<typeof EditImageInputSchema>, MagicaToolOutput> = createMagicaTool(
+  {
+    name: "edit_image",
+    description:
+      "Edit or modify 1-10 existing images using a text instruction describing the change, using GPT Image 2. Requires uploadedImages (public HTTPS URLs) — use generate_image to create a new image from scratch instead.",
+    nodeType: "gpt_image_2",
+    subModelId: "gpt-image-2-edit",
+    inputSchema: EditImageInputSchema,
+  },
+);
+
+// ---------- crop_image ----------
+// Exact field list copied from project-docs/magica/schemas/crop-image.json.
+// No mutual-exclusivity rule between the percent/px fields is enforced
+// — the discovered schema doesn't document one either; both sets
+// simply apply their own independent defaults when omitted.
+
+const CropImageInputSchema = z.object({
+  image_url: PublicHttpsUrlSchema,
+  x_percent: z.number().min(0).max(100).optional(),
+  y_percent: z.number().min(0).max(100).optional(),
+  width_percent: z.number().min(0).max(100).optional(),
+  height_percent: z.number().min(0).max(100).optional(),
+  width_px: z.number().int().min(1).optional(),
+  height_px: z.number().int().min(1).optional(),
+  x_px: z.number().int().min(0).optional(),
+  y_px: z.number().int().min(0).optional(),
+});
+
+export const cropImageTool: ToolDefinition<z.infer<typeof CropImageInputSchema>, MagicaToolOutput> = createMagicaTool(
+  {
+    name: "crop_image",
+    description:
+      "Crop an existing single image to a specific rectangular region, by percentage of the original or exact pixel coordinates — a purely geometric crop, no AI modification of pixel content.",
+    nodeType: "crop_image",
+    inputSchema: CropImageInputSchema,
+  },
+);
+
+// ---------- merge_videos ----------
+// `min(2)` is enforced here in application validation — the discovered
+// schema (project-docs/magica/schemas/merge-videos.json) documents a
+// 2-video minimum only in its field description text, not as a
+// machine-checkable constraint. No duration/codec field is invented —
+// none is documented.
+
+const MergeVideosInputSchema = z.object({
+  video_urls: z.array(PublicHttpsUrlSchema).min(2).max(100),
+  transition: z.enum(["none", "fade", "dissolve"]).optional(),
+});
+
+export const mergeVideosTool: ToolDefinition<z.infer<typeof MergeVideosInputSchema>, MagicaToolOutput> =
+  createMagicaTool({
+    name: "merge_videos",
+    description:
+      "Combine 2 to 100 existing videos into a single video, in the given order, with an optional transition between clips.",
+    nodeType: "merge_videos",
+    inputSchema: MergeVideosInputSchema,
   });

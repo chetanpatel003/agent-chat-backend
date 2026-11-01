@@ -233,7 +233,7 @@ describe("executeAgentTurn — Magica reconciliation on re-entry", () => {
       data: { chatId: chat.id, userId: owner.id, agentRunId: run.id, role: "ASSISTANT", status: "PENDING", content: [] },
     });
     const stale = await prisma.toolInvocation.create({
-      data: { agentRunId: run.id, toolName: MAGICA_FIXTURE_TOOL_NAME, idempotencyKey: randomUUID(), input: {}, status: "RUNNING", providerRunId: "magica_run_reentry" },
+      data: { agentRunId: run.id, toolName: MAGICA_FIXTURE_TOOL_NAME, idempotencyKey: randomUUID(), input: {}, status: "RUNNING", providerRunId: `magica_run_reentry_${randomUUID()}` },
     });
     await prisma.$executeRaw`UPDATE "AgentRun" SET "updatedAt" = ${new Date(Date.now() - 5 * 60_000)} WHERE "id" = ${run.id}::uuid`;
 

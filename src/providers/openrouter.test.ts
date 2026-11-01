@@ -258,4 +258,60 @@ describe("callOpenRouter — tool calling", () => {
     const result = await callOpenRouter([{ role: "user", content: "ping" }]);
     expect(result.toolCalls).toBeNull();
   });
+
+  // Phase 3.1 — tool-call validation hardening.
+  it("rejects a response with two tool_calls sharing the same id, as a malformed response — not a crash later when persisting it", async () => {
+    server.use(
+      http.post(URL, () =>
+        HttpResponse.json(
+          realShapeSuccess({
+            choices: [
+              {
+                index: 0,
+                finish_reason: "tool_calls",
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    { id: "dup", type: "function", function: { name: "a", arguments: "{}" } },
+                    { id: "dup", type: "function", function: { name: "b", arguments: "{}" } },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+      ),
+    );
+    await expect(callOpenRouter([{ role: "user", content: "x" }])).rejects.toMatchObject({
+      name: "OpenRouterDefiniteError",
+      code: "MALFORMED_RESPONSE",
+    });
+  });
+
+  it("rejects a tool_call with an empty id the same way", async () => {
+    server.use(
+      http.post(URL, () =>
+        HttpResponse.json(
+          realShapeSuccess({
+            choices: [
+              {
+                index: 0,
+                finish_reason: "tool_calls",
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [{ id: "", type: "function", function: { name: "a", arguments: "{}" } }],
+                },
+              },
+            ],
+          }),
+        ),
+      ),
+    );
+    await expect(callOpenRouter([{ role: "user", content: "x" }])).rejects.toMatchObject({
+      name: "OpenRouterDefiniteError",
+      code: "MALFORMED_RESPONSE",
+    });
+  });
 });

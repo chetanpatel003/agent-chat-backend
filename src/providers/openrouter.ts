@@ -81,7 +81,7 @@ export class OpenRouterAmbiguousError extends Error {
 }
 
 const ToolCallSchema = z.object({
-  id: z.string(),
+  id: z.string().min(1),
   type: z.literal("function"),
   function: z.object({
     name: z.string(),
@@ -89,11 +89,27 @@ const ToolCallSchema = z.object({
   }),
 });
 
-const MessageSchema = z.object({
-  content: z.string().nullable(),
-  reasoning: z.string().nullable().optional(),
-  tool_calls: z.array(ToolCallSchema).optional(),
-});
+// Phase 3.1: a provider response with two tool_calls sharing the same
+// `id` is a protocol violation, not a per-tool-call input problem — the
+// `id` is the correlation key OpenRouter's own protocol uses to match
+// each `tool`-role reply to its request, and `run-agent-turn.ts` uses
+// it to build `ToolInvocation.idempotencyKey` (unique in the schema).
+// Treating this as malformed-response (the existing MALFORMED_RESPONSE
+// path below) rather than inventing a new tool-level error means a
+// duplicate id can never reach the point of attempting two inserts
+// under one unique key — no new mechanism, reuses the same
+// OpenRouterDefiniteError path a non-conforming body already takes.
+const MessageSchema = z
+  .object({
+    content: z.string().nullable(),
+    reasoning: z.string().nullable().optional(),
+    tool_calls: z.array(ToolCallSchema).optional(),
+  })
+  .refine(
+    (message) =>
+      !message.tool_calls || new Set(message.tool_calls.map((call) => call.id)).size === message.tool_calls.length,
+    { message: "Duplicate tool_call id in provider response" },
+  );
 
 const ChoiceSchema = z.object({
   message: MessageSchema,

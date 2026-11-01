@@ -325,6 +325,49 @@ plan's A/B/C resolutions. Lighter than a from-scratch writeup since this
 plan document already carries most of the content.
 **1h.**
 
+> **Status: superseded, not "done" as originally scoped above.** A
+> full, separate, much more detailed instruction document — "Phase 2.5
+> — Application-Owned Skills System" — replaced this section's own
+> framing entirely before this checkpoint started, the same override
+> pattern checkpoint 2.4 received. What was actually delivered:
+> - **Decision A amended, narrowly.** `PRODUCTION_TOOL_REGISTRY` is no
+>   longer empty — it holds exactly two tools, `load_skill` and
+>   `read_skill_asset` (`src/tools/skills.ts`), both local-only (no
+>   provider call, no credit charge). Magica/business tools are still
+>   deferred to Phase 3; this is not a general reopening.
+> - A new `RunSkill` model and migration (`20261101135129_add_run_skill`)
+>   — the `RunSkill (skills durability)` deferral named in the schema's
+>   own header comment since checkpoint 1.1 (decisions/0006) is now
+>   resolved.
+> - An application-owned `agent-skills/` directory with three real,
+>   non-placeholder skills, a discovery/validation registry
+>   (`src/skills/registry.ts`) that fails loudly and aggregates every
+>   problem rather than silently skipping a bad bundle, and a path-
+>   security layer (`src/skills/paths.ts`) that resolves assets through
+>   a pre-vetted map lookup plus a read-time realpath re-check, never a
+>   raw `path.resolve()` on untrusted tool input.
+> - `executeAgentTurn` gained a fourth DI parameter (`skillRegistry`,
+>   same pattern as `registry`/`publish`) and now prepends a synthesized
+>   skill-metadata system prompt to `history` — no new orchestration
+>   branch for skills.
+> - A genuine design finding during implementation, verified rather
+>   than assumed: the P2002 error shape documented in decisions/0009 for
+>   a hand-added raw-SQL *partial* index (`driverAdapterError.cause.
+>   constraint.index`, never the naive `{ target: [...] }` shape) turned
+>   out to apply identically to this checkpoint's *normal*,
+>   schema-declared composite unique constraint — confirmed with a
+>   standalone diagnostic script against the real database, not guessed
+>   from the prior case.
+> - One of this document's own draft design choices (requiring a
+>   skill's frontmatter `name` to equal its directory name) was reversed
+>   mid-implementation: it made the explicitly-required "reject
+>   duplicate skill names across different directories" behavior
+>   structurally unreachable (two sibling directories can never share a
+>   name), so the check was dropped rather than kept as dead weight.
+> Full detail: API_CONTRACTS.md's "Application-owned skills system"
+> section, DATABASE.md's checkpoint 2.5 entry, and the checkpoint 2.5
+> completion report for exact test counts.
+
 **Total: ~11.5h.** Half an hour over the 10h target, entirely accounted
 for by 2.2 and 2.4's crash/cancellation tests — the two tests that most
 directly prove decision C's correctness requirement rather than just
@@ -370,3 +413,49 @@ No schema change. No Phase 1 file touched. No event bus — Trigger.dev's
 own metadata API is the entire "publishing interface." The one scope
 trim beyond what was explicitly asked (§6, checkpoint 2.3's `reconcile`
 test depth) is named plainly, not hidden in an estimate.
+
+## Checkpoint 3.1 — Execution Framework Hardening
+
+> **Status: done.** A dedicated hardening pass on the tool-calling
+> execution framework before Magica integration, per its own separate
+> instruction document (not part of this plan's original §6 sequence).
+> Continued from the repo's actual current state (checkpoint 2.4
+> committed as `aa5fdc4`, checkpoint 2.5 staged on top) rather than
+> reverting to committed `main` alone — the hardening targets (the tool
+> loop, concurrency, retry) are inherited unchanged in substance from
+> 2.4; 2.5's own changes to `run-agent-turn.ts` were orthogonal (a 4th
+> DI parameter, one prepended system message) and untouched here.
+>
+> Five areas, each investigated against the real current code first
+> (not the prior reports describing it):
+> 1. **Max-round boundary** — the Phase 3 prerequisite named since 2.4
+>    (a last-round `tool_calls` response was still executed even though
+>    its result could never reach the model) is now fixed:
+>    `recordTurnLimitCancellation` records each such call `CANCELLED`
+>    instead, never executing it, never silently dropping it.
+> 2. **Tool-call validation** — found a real gap via code inspection,
+>    not just reasoning: two `tool_calls` sharing one `id` in a provider
+>    response would have crashed via an unhandled P2002 on
+>    `ToolInvocation.idempotencyKey`. Fixed at response-validation time
+>    in `openrouter.ts` (reuses the existing `MALFORMED_RESPONSE` path).
+> 3. **Invocation lifecycle** — `runOneToolCall`'s execution and
+>    persistence were previously one try/catch; a persistence failure
+>    after a successful execution risked a second write attempt
+>    mischaracterizing it. Now strictly separated, exactly one
+>    `toolInvocation.update()` call on every path.
+> 4. **Retry/idempotency** — investigated and found already correct by
+>    design; documented explicitly (the three crash windows) rather
+>    than rebuilt. No generic framework introduced, per the brief's own
+>    instruction.
+> 5. **The concurrency race** — re-investigated per the brief's explicit
+>    instruction not to assume Trigger.dev idempotency makes it
+>    impossible without evidence. Confirmed again, deterministically,
+>    then fixed with `isAgentRunRecentlyActive` (reuses the existing
+>    `AgentRun.updatedAt` write already happening every round as a
+>    liveness signal — no heartbeat table, no lease, no new
+>    abstraction). The race-reproduction test now resolves
+>    deterministically instead of "either outcome, both safe."
+>
+> Full mechanism and before/after behavior: API_CONTRACTS.md. Exact
+> test results: TEST_STATUS.md and the checkpoint 3.1 completion
+> report. Staged, not committed, per standing instruction.

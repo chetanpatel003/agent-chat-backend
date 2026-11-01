@@ -14,9 +14,13 @@ import { buildConversationContext } from "@/providers/conversation-context";
 import { PRODUCTION_TOOL_REGISTRY, toOpenRouterTools } from "@/tools/registry";
 import type { ToolRegistry } from "@/tools/types";
 import type { ContentBlock } from "@/contracts/message";
+import { PRODUCTION_SKILL_REGISTRY, listSkillMetadata } from "@/skills/registry";
+import { buildSkillSystemPrompt } from "@/skills/prompt";
+import type { SkillRegistry } from "@/skills/types";
 import {
   ACTIVE_RUN_STATUSES,
   casAgentRunStatus,
+  isAgentRunRecentlyActive,
   readAgentRunStatus,
   SkippedTransition,
   type GuardedTransitionResult,
@@ -39,14 +43,12 @@ const TERMINAL_STATUSES: AgentRunStatus[] = ["COMPLETED", "FAILED", "CANCELLED"]
 // multi-step tool chain, small enough to bound cost/latency decisively
 // rather than let a confused model loop indefinitely.
 //
-// Phase 3 prerequisite (not fixed in 2.4 — out of scope, documented so
-// it isn't lost): on the *last* allowed round, a tool_calls response is
-// still executed even though its result can never be sent back to the
-// model (the loop ends right after, via TURN_LIMIT_EXCEEDED) — real
-// external tool work (and credits) would be spent for nothing. Before
-// registering real Magica tools, stop dispatching new tool calls once
-// `turn === MAX_TURNS - 1` and go straight to the turn-limit failure
-// instead.
+// Phase 3.1 (fixed, was a documented Phase 3 prerequisite through 2.5):
+// on the *last* allowed round, a tool_calls response is never executed
+// — see the `turn === MAX_TURNS - 1` branch below — since its result
+// could never be sent back to the model anyway (the loop ends right
+// after, via TURN_LIMIT_EXCEEDED). Each requested call is recorded
+// CANCELLED instead of silently dropped.
 const MAX_TURNS = 8;
 
 /**
@@ -388,64 +390,115 @@ async function runOneToolCall(params: {
   });
   await emit({ type: "tool_started", toolInvocationId: invocation.id, toolName: tool.name });
 
+  // Execution and persistence are deliberately separated (Phase 3.1
+  // hardening): this block ONLY decides the tool's own outcome — it
+  // never writes to the database. A persistence failure (the single
+  // `toolInvocation.update()` below) is a genuinely unexpected
+  // infrastructure problem, not a tool-execution outcome, and must
+  // never be caught here and mischaracterized as one — doing so
+  // previously risked a *second* write attempt inside that same catch,
+  // which could itself fail and escape uncaught, or could silently
+  // overwrite an accurate EXECUTION_FAILED/INVALID_OUTPUT reason with a
+  // misleading one describing a DB error instead. There is now exactly
+  // one `toolInvocation.update()` call on every path, and if it throws,
+  // it propagates uncaught — exactly the same principle already applied
+  // to the OpenRouter call itself in the main loop below ("rethrow and
+  // let Trigger.dev's retry policy + the re-entry/ambiguous-outcome
+  // mechanism handle it").
   const startedAt = Date.now();
+  let outcome: { ok: true; output: unknown } | { ok: false; errorCode: string; errorMessage: string };
   try {
     const rawOutput = await tool.execute(parsedInput.data, { agentRunId, userId });
-    const durationMs = Date.now() - startedAt;
     const parsedOutput = tool.outputSchema.safeParse(rawOutput);
-    if (!parsedOutput.success) {
-      const errorMessage = `Tool returned output that didn't match its declared schema: ${parsedOutput.error.message}`;
-      const failed = await prisma.toolInvocation.update({
-        where: { id: invocation.id },
-        data: { status: "FAILED", errorCode: "INVALID_OUTPUT", errorMessage, durationMs },
-      });
-      await emit({
-        type: "tool_failed",
-        toolInvocationId: failed.id,
-        toolName: tool.name,
-        durationMs,
-        errorCode: "INVALID_OUTPUT",
-      });
-      return buildToolCallOutcome(failed, toolCall, rawInput, null, {
-        code: "INVALID_OUTPUT",
-        message: errorMessage,
-      });
-    }
+    outcome = parsedOutput.success
+      ? { ok: true, output: parsedOutput.data }
+      : {
+          ok: false,
+          errorCode: "INVALID_OUTPUT",
+          errorMessage: `Tool returned output that didn't match its declared schema: ${parsedOutput.error.message}`,
+        };
+  } catch (error) {
+    outcome = {
+      ok: false,
+      errorCode: "EXECUTION_FAILED",
+      errorMessage: error instanceof Error ? error.message : "Tool execution failed",
+    };
+  }
+  const durationMs = Date.now() - startedAt;
+
+  if (outcome.ok) {
     const completed = await prisma.toolInvocation.update({
       where: { id: invocation.id },
-      data: {
-        status: "COMPLETED",
-        output: parsedOutput.data as Prisma.InputJsonValue,
-        durationMs,
-      },
+      data: { status: "COMPLETED", output: outcome.output as Prisma.InputJsonValue, durationMs },
     });
     await emit({ type: "tool_completed", toolInvocationId: completed.id, toolName: tool.name, durationMs });
-    return buildToolCallOutcome(
-      completed,
-      toolCall,
-      rawInput,
-      parsedOutput.data as Record<string, unknown>,
-      null,
-    );
-  } catch (error) {
-    const durationMs = Date.now() - startedAt;
-    const errorMessage = error instanceof Error ? error.message : "Tool execution failed";
-    const failed = await prisma.toolInvocation.update({
-      where: { id: invocation.id },
-      data: { status: "FAILED", errorCode: "EXECUTION_FAILED", errorMessage, durationMs },
-    });
-    await emit({
-      type: "tool_failed",
-      toolInvocationId: failed.id,
-      toolName: tool.name,
-      durationMs,
-      errorCode: "EXECUTION_FAILED",
-    });
-    return buildToolCallOutcome(failed, toolCall, rawInput, null, {
-      code: "EXECUTION_FAILED",
-      message: errorMessage,
-    });
+    return buildToolCallOutcome(completed, toolCall, rawInput, outcome.output as Record<string, unknown>, null);
   }
+
+  const failed = await prisma.toolInvocation.update({
+    where: { id: invocation.id },
+    data: { status: "FAILED", errorCode: outcome.errorCode, errorMessage: outcome.errorMessage, durationMs },
+  });
+  await emit({
+    type: "tool_failed",
+    toolInvocationId: failed.id,
+    toolName: tool.name,
+    durationMs,
+    errorCode: outcome.errorCode,
+  });
+  return buildToolCallOutcome(failed, toolCall, rawInput, null, {
+    code: outcome.errorCode,
+    message: outcome.errorMessage,
+  });
+}
+
+/**
+ * Records one model-requested tool call as CANCELLED, without ever
+ * calling `execute()` — used only for a call the model requests on the
+ * *last* permitted round, whose result could never be sent back for
+ * the model to use (there is no further round). Reuses the exact same
+ * ToolInvocation/content-block vocabulary as an executed call
+ * (`ToolInvocationStatus.CANCELLED` already exists in the schema) so
+ * the model's unmet request is durably visible — a real, auditable row
+ * and a `tool_use`/`tool_result` block pair — never silently dropped.
+ */
+async function recordTurnLimitCancellation(params: {
+  toolCall: ProviderToolCall;
+  agentRunId: string;
+  messageId: string;
+  emit: EmitRunEvent;
+}): Promise<ToolCallOutcome> {
+  const { toolCall, agentRunId, messageId, emit } = params;
+  let rawInput: unknown;
+  try {
+    rawInput = JSON.parse(toolCall.function.arguments);
+  } catch {
+    rawInput = toolCall.function.arguments;
+  }
+
+  const invocation = await prisma.toolInvocation.create({
+    data: {
+      agentRunId,
+      messageId,
+      toolName: toolCall.function.name,
+      idempotencyKey: `${agentRunId}:${toolCall.id}`,
+      input: rawInput as Prisma.InputJsonValue,
+      status: "CANCELLED",
+      errorCode: "TURN_LIMIT_EXCEEDED",
+      errorMessage:
+        "The maximum number of turns was reached before this tool call could be executed; its result could never have been returned to the model, so it was never run.",
+    },
+  });
+  await emit({
+    type: "tool_failed",
+    toolInvocationId: invocation.id,
+    toolName: invocation.toolName,
+    errorCode: "TURN_LIMIT_EXCEEDED",
+  });
+  return buildToolCallOutcome(invocation, toolCall, rawInput, null, {
+    code: "TURN_LIMIT_EXCEEDED",
+    message: invocation.errorMessage!,
+  });
 }
 
 /**
@@ -455,19 +508,24 @@ async function runOneToolCall(params: {
  * every behavioral test. `pnpm trigger:dev` is still how this actually
  * runs in dev/prod; see run-agent-turn.test.ts for why both matter.
  *
- * `registry` and `publish` both default to the production
- * implementations (the empty registry per Decision A; the real
- * Trigger.dev-metadata publisher) and are dependency-injected rather
- * than module-mocked — the same pattern established in checkpoint 2.3
- * for the registry, now extended to the publisher for the same reason:
- * module-mocking Trigger.dev's own SDK was found fragile in checkpoint
- * 2.2 (a `vi.spyOn` on the task silently failed to intercept a real
- * call).
+ * `registry`, `publish`, and `skillRegistry` all default to the
+ * production implementations (the tool registry — the two skill-
+ * loading tools as of checkpoint 2.5, per Decision A's amendment; the
+ * real Trigger.dev-metadata publisher; the real `agent-skills/`
+ * discovery result) and are dependency-injected rather than module-
+ * mocked — the same pattern established in checkpoint 2.3 for the tool
+ * registry, extended in 2.4 to the publisher and now in 2.5 to the
+ * skill registry, for the same reason each time: module-mocking
+ * Trigger.dev's own SDK was found fragile in checkpoint 2.2 (a
+ * `vi.spyOn` on the task silently failed to intercept a real call), and
+ * tests should not be coupled to the real `agent-skills/` directory's
+ * actual contents either.
  */
 export async function executeAgentTurn(
   payload: RunAgentTurnPayload,
   registry: ToolRegistry = PRODUCTION_TOOL_REGISTRY,
   publish: PublishRunEvent = publishRunEvent,
+  skillRegistry: SkillRegistry = PRODUCTION_SKILL_REGISTRY,
 ) {
   const run = await prisma.agentRun.findUniqueOrThrow({
     where: { id: payload.agentRunId },
@@ -492,10 +550,23 @@ export async function executeAgentTurn(
   // — not a full resume-and-continue path — and still ends the run
   // FAILED/AMBIGUOUS either way. The ToolInvocation itself is left
   // RUNNING as evidence, same principle as the Message-PENDING marker.
+  //
+  // Phase 3.1: before concluding "stale," check whether this AgentRun
+  // has been written to recently (`isAgentRunRecentlyActive`) — a
+  // genuinely concurrent sibling execution (or this very run, moments
+  // into its own work) looks identical to a crashed one at this exact
+  // instant, and guessing wrong here used to be able to flip an
+  // in-progress run to FAILED out from under its own legitimate
+  // completion (see API_CONTRACTS.md, checkpoint 2.4's "known, accepted
+  // trade-off" — closed by this check, not assumed away). Backing off
+  // writes nothing and lets whoever is actually alive finish.
   const staleToolInvocation = await prisma.toolInvocation.findFirst({
     where: { agentRunId: run.id, status: "RUNNING" },
   });
   if (staleToolInvocation) {
+    if (await isAgentRunRecentlyActive(run.id)) {
+      return { status: await readAgentRunStatus(run.id), skipped: true as const, ambiguous: false as const };
+    }
     const tool = registry.get(staleToolInvocation.toolName);
     if (tool?.reconcile) {
       await tool
@@ -515,10 +586,18 @@ export async function executeAgentTurn(
   // mid-flight. This runs before any new work, so it can't be bypassed
   // by a retry racing ahead of it, and it never issues a second
   // OpenRouter request for an attempt whose outcome is unknown.
+  //
+  // Same liveness check as above, same reason: this is the exact
+  // checkpoint where the checkpoint-2.4 concurrency test's race was
+  // traced to — a sibling's own still-PENDING message looked
+  // indistinguishable from a crashed one.
   const stalePending = await prisma.message.findFirst({
     where: { agentRunId: run.id, role: "ASSISTANT", status: "PENDING" },
   });
   if (stalePending) {
+    if (await isAgentRunRecentlyActive(run.id)) {
+      return { status: await readAgentRunStatus(run.id), skipped: true as const, ambiguous: false as const };
+    }
     return ambiguousOutcome(run.id, emit);
   }
 
@@ -536,7 +615,19 @@ export async function executeAgentTurn(
   }
   await emit({ type: "run_status", status: "RUNNING" });
 
-  const history = await buildConversationContext(run.chatId);
+  // The skill system prompt is synthesized fresh on every entry (never
+  // persisted as a Message) from the injected skill registry's current
+  // metadata — same "rebuild from source, nothing cached in process
+  // memory" principle buildConversationContext already follows for chat
+  // history. It carries only name+description for every registered
+  // skill, never a skill's body; a skill's own instructions only reach
+  // the model when load_skill actually returns them, as an ordinary
+  // tool result already flowing back through `turnMessages` below.
+  const skillSystemPrompt: ProviderMessage = {
+    role: "system",
+    content: buildSkillSystemPrompt(listSkillMetadata(skillRegistry)),
+  };
+  const history = [skillSystemPrompt, ...(await buildConversationContext(run.chatId))];
 
   // Committed before the provider call — this row is "persist the
   // request/attempt state before making the call." It accumulates every
@@ -627,6 +718,39 @@ export async function executeAgentTurn(
       return successOutcome(run.id, pendingMessage.id, run.chatId, content, result, emit);
     }
 
+    // The *last* permitted round: a tool_calls response here can never
+    // be returned to the model (there is no round `turn + 1` to feed
+    // the result back into) — executing it would spend real work (real
+    // external-provider credits, once Phase 3 registers Magica tools)
+    // for an outcome nothing can ever use. Each requested call is
+    // recorded CANCELLED instead of executed — a real, auditable
+    // ToolInvocation + content-block pair, never silently discarded —
+    // and the run ends via the same TURN_LIMIT_EXCEEDED path used when
+    // the model never stops requesting tools at all.
+    if (turn === MAX_TURNS - 1) {
+      for (const toolCall of result.toolCalls) {
+        const outcome = await recordTurnLimitCancellation({
+          toolCall,
+          agentRunId: run.id,
+          messageId: pendingMessage.id,
+          emit,
+        });
+        content.push(...outcome.blocks);
+      }
+      await prisma.message.update({
+        where: { id: pendingMessage.id },
+        data: { content: content as Prisma.InputJsonValue },
+      });
+      return definiteFailureOutcome(
+        run.id,
+        pendingMessage.id,
+        "TURN_LIMIT_EXCEEDED",
+        "The agent requested additional tool calls on the final permitted turn; they could not be executed because their results could never have been returned to the model. See the accompanying tool_use/tool_result blocks.",
+        content,
+        emit,
+      );
+    }
+
     // The model asked for one or more tools. Its own tool-calling
     // message must be recorded before anything else, exactly as
     // OpenRouter's protocol requires: an assistant tool_calls message is
@@ -685,8 +809,8 @@ export const runAgentTurn = task({
   // Wrapped, not passed directly: Trigger.dev calls `run(payload, ctx)`
   // with its own second argument, which would otherwise land in
   // executeAgentTurn's `registry` parameter and silently break the
-  // default. Production always gets the one-argument call, so both
-  // defaults (the empty PRODUCTION_TOOL_REGISTRY, the real publisher)
-  // apply.
+  // default. Production always gets the one-argument call, so all three
+  // defaults (PRODUCTION_TOOL_REGISTRY, the real publisher,
+  // PRODUCTION_SKILL_REGISTRY) apply.
   run: (payload: RunAgentTurnPayload) => executeAgentTurn(payload),
 });

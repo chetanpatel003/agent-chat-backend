@@ -400,39 +400,309 @@ worker itself also never publishes when it merely *detects* a
 cancellation mid-loop, since it caused no new transition of its own to
 announce.
 
-**A known, accepted trade-off, found by the concurrency test itself:**
-two truly concurrent in-process `executeAgentTurn()` calls for the same
-run can race between the "winner" (the one whose `message.create()`
-succeeds) completing normally and the "loser" discovering the winner's
-still-`PENDING` message via the stale-message re-entry check — which
-has no way to tell "a previous attempt crashed, abandoned" apart from
-"a sibling is actively, legitimately working on this right now" — and
-marking the run `FAILED`/`AMBIGUOUS_PROVIDER_OUTCOME` *before* the
-winner's own provider call resolves. When this happens, the winner's
-own guarded `finalizeSuccess` transaction correctly finds the run no
-longer active and backs off (its `AgentRun` sub-update affects zero
-rows) — so the outcome is never corrupted (still exactly one message,
-one provider call, one terminal state), but the specific terminal state
-can be the less-ideal one, discarding a perfectly good answer. **Not
-fixed in 2.4**, deliberately: a real fix needs genuine liveness
-information (a heartbeat/lease, or querying Trigger.dev's own run
-status) that doesn't exist anywhere in this design and wasn't in
-scope — "do not build a generic state-machine framework." It's accepted
-because Trigger.dev's own `idempotencyKey` plus its liveness-based
-retry semantics (a retry only fires once the platform has independently
-concluded the previous attempt is dead) mean this specific race
-essentially cannot happen between two *separate* Trigger.dev dispatches
-in production; the test exercises a more aggressive, synthetic
-same-process race than production ever produces.
+**The concurrency race documented here through checkpoint 2.4 is fixed
+as of checkpoint 3.1** — see "Liveness-guarded re-entry" below. The
+paragraph above is kept (not deleted) as the accurate historical record
+of what checkpoint 2.4 actually shipped and why it was accepted at the
+time; it was revisited, not assumed safe, once asked to investigate
+further.
 
-**Phase 3 prerequisite, not fixed in 2.4 (scope explicitly excludes
-changing `MAX_TURNS` behavior):** on the *last* allowed round, a
-`tool_calls` response is still executed even though its result can
-never be sent back to the model — the loop ends right after via
-`TURN_LIMIT_EXCEEDED`. Real external tool work (and credits) would be
-spent for nothing. Before registering real Magica tools, stop
-dispatching new tool calls once `turn === MAX_TURNS - 1` and go straight
-to the turn-limit failure instead.
+### Liveness-guarded re-entry (checkpoint 3.1)
+
+**The gap:** both re-entry checks above (`staleToolInvocation`,
+`stalePending`) had no way to tell "a previous attempt crashed,
+genuinely abandoned" apart from "a sibling — or this very run, moments
+into its own legitimate work — is actively in progress right now." A
+truly concurrent second execution looks *identical* to a crashed one at
+the instant either check runs. Checkpoint 2.4 accepted this as a narrow
+trade-off, reasoning that Trigger.dev's own idempotency and liveness-
+based retry semantics make two genuinely concurrent executions of the
+same `AgentRun` essentially impossible in production. Checkpoint 3.1
+was explicitly instructed not to assume that without evidence, and
+instead to determine whether the losing execution really can
+incorrectly transition the run to `FAILED` — it can (confirmed again,
+deterministically, by `run-agent-turn.test.ts`'s reproduction test) —
+and to implement the smallest safe correction if one exists.
+
+**The fix:** `isAgentRunRecentlyActive(agentRunId)` in
+`src/services/run-transitions.ts`. Every round of the tool-calling loop
+already bumps `AgentRun.updatedAt` (the `turnCount` write, before
+calling the provider), and the initial CAS to `RUNNING` does too — a
+genuinely live execution's `updatedAt` is never older than roughly one
+round's worst-case duration. This repurposes that *already-existing*
+write as a liveness signal: no new column, no heartbeat loop, no lease
+table, no generic framework — exactly the "smallest safe correction,"
+not a new abstraction. Both re-entry checks now ask this question
+first; if the row was written to within the last
+`STALE_RUN_LIVENESS_THRESHOLD_MS` (120s — comfortable margin over one
+round's worst case, far below the many minutes a legitimate multi-round
+conversation could still be in progress for), the check backs off
+immediately (`{ status: <current>, skipped: true, ambiguous: false }`,
+nothing written) instead of concluding "stale." Only once that window
+has passed does either check fall through to its original behavior
+(`reconcile()`/ambiguous for a stale tool invocation; ambiguous for a
+stale pending message) — crash recovery still works, it just correctly
+waits out the window a live sibling could still be in before concluding
+one.
+
+**Effect on the concurrency race:** the two-concurrent-executions test
+now resolves deterministically — the loser backs off (via this check,
+or via losing the message-insert race outright, both safe) and the
+winner completes normally, every run, not "either outcome, both safe."
+See `run-agent-turn.test.ts`'s "liveness-guarded re-entry" describe
+block for the direct regression test, and the existing checkpoint-2.4
+concurrency test's updated assertions (it now asserts `COMPLETED`
+specifically).
+
+**What this does not change:** a tool whose real side effect completes
+synchronously but crashes *after* `execute()` returns and *before* the
+single `toolInvocation.update()` persisting it commits still has no
+recovery path without that tool defining `reconcile()` — this was
+already true before 3.1 and remains an explicit requirement for any
+real external-provider tool (Magica, Phase 3), not something a time-
+based liveness check can address. See "Retry and idempotency behavior"
+below for the full crash-window analysis.
+
+### Tool-call validation hardening (checkpoint 3.1)
+`src/providers/openrouter.ts`'s `ToolCallSchema` now requires a
+non-empty `id`, and `MessageSchema` rejects a response where two
+`tool_calls` share the same `id` — both via the *existing*
+`MALFORMED_RESPONSE`/`OpenRouterDefiniteError` path a non-conforming
+body already took, not a new error type. A duplicate id is a provider-
+protocol violation (it's the correlation key for matching a `tool`-role
+reply, and `run-agent-turn.ts` derives `ToolInvocation.idempotencyKey`
+from it, which is unique in the schema) — catching it at response-
+validation time means it can never reach the point of attempting two
+inserts under one unique key.
+
+### Invocation lifecycle hardening (checkpoint 3.1)
+`runOneToolCall` previously wrapped *both* `tool.execute()` and the
+persistence of its outcome in one try/catch — a persistence failure
+after a successful execution (the `toolInvocation.update()` marking
+`COMPLETED`) fell into the same catch as an execution failure, which
+then attempted a *second* write (`FAILED`/`EXECUTION_FAILED`) that
+could itself fail and escape uncaught, or could silently overwrite an
+accurate failure reason with a misleading one describing a DB error
+instead. Execution and persistence are now strictly separated: the try
+block decides only the tool's own outcome (`{ ok: true, output } | {
+ok: false, errorCode, errorMessage }`), and there is exactly one
+`toolInvocation.update()` call on every path, outside that try block.
+If *that* write throws, it now propagates uncaught — the same
+"rethrow and let Trigger.dev's retry policy + the re-entry/ambiguous-
+outcome mechanism handle it" principle already applied to the
+OpenRouter call itself, applied consistently to tool persistence too.
+
+### Max-round boundary (checkpoint 3.1 — closes the Phase 3 prerequisite from 2.4/2.5)
+On the *last* permitted round (`turn === MAX_TURNS - 1`), a `tool_calls`
+response is no longer executed — its result could never be returned to
+the model (there is no further round), so running it would spend real
+work (real external-provider credits, once Phase 3 registers Magica
+tools) for nothing. Each requested call is instead recorded `CANCELLED`
+via `recordTurnLimitCancellation` — a real `ToolInvocation` row
+(`errorCode: "TURN_LIMIT_EXCEEDED"`) and the usual `tool_use`/
+`tool_result` content-block pair, reusing the existing
+`ToolInvocationStatus.CANCELLED` value already in the schema — never
+silently dropped. The run still ends `FAILED`/`TURN_LIMIT_EXCEEDED`,
+exactly as when the model never stops requesting tools at all;
+`MAX_TURNS` itself is unchanged (`8`), per this checkpoint's own
+explicit instruction to preserve existing contracts unless essential.
+
+### Retry and idempotency behavior (checkpoint 3.1 — documented, not newly built)
+Every operation in this loop was already designed so a retry/re-entry
+never blindly repeats non-idempotent work; this section makes that
+explicit rather than implicit, per the three crash windows named in
+the brief:
+- **Before a tool's `ToolInvocation` row exists** (crash between the
+  model requesting a call and `prisma.toolInvocation.create({status:
+  "RUNNING"})` committing): nothing to find for that specific call on
+  re-entry, but the enclosing assistant `Message` is still `PENDING` —
+  caught by the liveness-guarded `stalePending` check once genuinely
+  stale. The tool itself was never executed; no duplicate-execution
+  risk.
+- **During execution** (the row is `RUNNING`; `execute()` is in flight,
+  or has returned but the single persisting write hasn't happened
+  yet): re-entry's liveness-guarded `staleToolInvocation` check either
+  calls `reconcile()` (if the tool defines one) or marks the run
+  ambiguous once genuinely stale — `execute()` is never called a second
+  time for a `RUNNING` invocation, by construction (there is no code
+  path that does). This is the one case `reconcile()` exists for: a
+  tool whose side effect genuinely completed before the crash can be
+  recovered by polling the provider's own run status; a tool with no
+  `reconcile()` has no way back and the run ends ambiguous — an
+  accepted limitation for today's fixture tool (synchronous, no real
+  external run) and an explicit, now-documented **requirement** for any
+  real Magica tool registered in Phase 3, not an assumption.
+- **After execution but before the result is persisted** (narrowed by
+  the lifecycle hardening above, but not eliminated — a window of one
+  `await` still exists between `execute()` returning and the update
+  committing): if the process dies in exactly this window, the
+  `ToolInvocation` stays `RUNNING` and the same re-entry path as
+  "during execution" applies. For a tool with no `reconcile()`, a
+  genuinely-completed-but-unpersisted result is lost from the system's
+  perspective (durable only as "this ran and we don't know the
+  outcome," never silently re-run). Eliminating this window entirely
+  would need wrapping a tool's own side effect and its persistence in
+  one atomic unit — not possible in general for a real external
+  provider call, and out of this checkpoint's scope to attempt.
+
+**What is safe to retry, stated plainly:** re-invoking `executeAgentTurn`
+for the same `agentRunId` is always safe, at any point, any number of
+times — every code path either makes forward progress exactly once
+(guarded by a CAS, a unique constraint, or the liveness check) or backs
+off without writing anything. Nothing in this design ever automatically
+retries a tool's `execute()` call itself; the only "retry" that exists
+is Trigger.dev's own task-level retry of the *orchestration*, which
+this re-entry logic was built to make safe to repeat indefinitely.
+
+## Application-owned skills system (checkpoint 2.5)
+
+**Decision A amended, narrowly.** `PRODUCTION_TOOL_REGISTRY` stopped
+being empty — it now contains exactly `load_skill` and
+`read_skill_asset`. Both are local-only (no external provider call, no
+credit charge, no business side effect), registered because this
+checkpoint's own instructions required it. Magica/business tools
+remain deferred to Phase 3; this is not a general reopening of
+Decision A. One consequence worth naming plainly: every real production
+call to OpenRouter now sends these two tool definitions (previously,
+with an empty registry, `tools` was omitted from the request entirely)
+— `send-turn.test.ts`'s pre-existing live end-to-end test therefore now
+exercises a real conversation that *can* see live tool-calling for the
+first time, not only the plain-text path checkpoints 2.1–2.4 verified.
+
+### Skill bundle format
+`agent-skills/<skill-name>/SKILL.md`, optionally with supporting files
+(e.g. `guides/*.md`) in subdirectories. `SKILL.md` requires YAML
+frontmatter with `name` (lowercase kebab-case, 2–64 chars) and
+`description` (1–500 chars), followed by the skill's instructions body
+in Markdown. Three real, non-placeholder skills ship: `image-editing`
+(crop/generative-edit planning, with a `guides/composition.md`
+supporting file), `video-editing` (merge/sequencing planning),
+`image-analysis` (description/quality-check planning). Content is
+guidance text only — asset files are restricted to `.md`; nothing a
+skill ships is executable, and nothing in the loader ever executes
+skill content as code.
+
+### Registry and discovery (`src/skills/registry.ts`)
+`discoverSkills(rootDir)` walks the directory once, validates every
+bundle's frontmatter (Zod), rejects empty/oversized `SKILL.md` files
+(32KB cap), and rejects a duplicate declared `name` across different
+directories — collecting *every* problem found before throwing one
+aggregated `SkillDiscoveryError`, so a bad startup state is loud and
+actionable, never a silent partial registration. A *supporting asset's*
+own problems (wrong extension, oversized, a symlink that escapes the
+skill directory) only exclude that one asset from the approved set —
+they don't fail the whole skill, unlike a problem in `SKILL.md` itself.
+`PRODUCTION_SKILL_REGISTRY` is an eager singleton built from the real
+`agent-skills/` directory at module load — "discover at application
+startup," literally, mirroring `PRODUCTION_TOOL_REGISTRY`'s own
+pattern. `listSkillMetadata(registry)` exposes only `name` +
+`description`, sorted, for every registered skill — never a skill's
+body or its real filesystem directory.
+
+### Agent prompt integration (`src/skills/prompt.ts`)
+`executeAgentTurn` now takes a fourth dependency-injected parameter,
+`skillRegistry` (default `PRODUCTION_SKILL_REGISTRY` — same pattern as
+`registry`/`publish`), and prepends one synthesized `system` message —
+built fresh every entry from `buildSkillSystemPrompt(listSkillMetadata(...))`,
+never persisted as a `Message` — to `history` before the loop. It lists
+every registered skill's name and description and explains when to call
+`load_skill`/`read_skill_asset`; it never contains a skill's
+instructions body. A skill's actual instructions only reach the model
+once `load_skill` is called for it — returned as an ordinary tool
+result, flowing back into context through the *existing*
+`turnMessages` mechanism from checkpoint 2.3, no new orchestration
+branch.
+
+### `load_skill` / `read_skill_asset` contracts (`src/tools/skills.ts`)
+Both are ordinary `ToolDefinition`s built by a small factory
+(`createLoadSkillTool(skillRegistry)` / `createReadSkillAssetTool(skillRegistry)`)
+so tests can bind them to a fixture registry instead of the real
+`agent-skills/` directory — the production singletons
+(`loadSkillTool`/`readSkillAssetTool`) bind to `PRODUCTION_SKILL_REGISTRY`.
+Everything about validation, persistence, and the Zod input/output
+boundary flows through the *existing* tool-execution mechanism
+(`runOneToolCall` in `run-agent-turn.ts`) unchanged — no special
+skill-execution branch was added to the agent loop.
+
+- **`load_skill({ name })`** → `{ name, description, instructions,
+  contentHash, previouslyLoaded }`. Unknown name → a plain thrown
+  `Error` ("No skill named ..."), which the existing mechanism turns
+  into an ordinary `FAILED`/`EXECUTION_FAILED` `ToolInvocation` — a
+  model-hallucinated skill name fails exactly like a model-hallucinated
+  tool name already does, no new error path. On success, persists (or
+  confirms) a `RunSkill` row keyed by `(agentRunId, skillName)`.
+- **`read_skill_asset({ skillName, assetPath })`** → `{ skillName,
+  assetPath, content, contentHash }`. Requires the skill to already be
+  loaded for *this* `AgentRun` — checked against the durable `RunSkill`
+  row, not an in-memory flag, so it holds identically whether this is
+  the same execution continuing or a fresh process re-entering after a
+  crash. `assetPath` is resolved via `resolveApprovedAsset` (below);
+  any failure (unknown skill, unknown/unapproved asset, not-yet-loaded
+  skill) is a uniform rejection message — never which specific check
+  failed.
+
+### Security boundaries (`src/skills/paths.ts`)
+`read_skill_asset` never calls `path.resolve()` on the caller's raw
+input against the filesystem. Instead: (1) the requested path is
+normalized (percent-decoded first, so an encoded traversal attempt is
+caught by the same check as a literal one) and must exactly match a key
+already present in that skill's `assets` map — a map built entirely
+from a safe, realpath-contained directory walk at discovery time. This
+alone defeats every traversal/absolute-path/encoded-path attempt,
+since none of those strings can ever equal a legitimately-discovered
+relative path — "unknown asset," not a path-resolution outcome. (2)
+Even for a map hit, the file is re-resolved via `fs.realpathSync` and
+re-checked against the skill's own realpath'd directory *again*, right
+before reading — closing the gap where a file could be replaced or
+symlinked after startup (TOCTOU), not trusting the discovery-time cache
+alone. Extension (`.md` only) and size (64KB cap) are re-checked at
+this same point. No tool, skill, or asset can read outside its own
+skill directory, execute code, read environment variables, or see raw
+filesystem paths — tool outputs only ever carry the relative path the
+caller asked for.
+
+### Durable persistence and resume behavior
+`RunSkill(agentRunId, skillName, contentHash)`, unique on
+`(agentRunId, skillName)` — see DATABASE.md. `load_skill`'s own logic:
+no existing row → insert, `previouslyLoaded: false`; an existing row
+with a matching `contentHash` → return the same cached values,
+`previouslyLoaded: true`, no new row (checkpoint requirement:
+"repeated loading returns the same persisted version"); an existing row
+whose `contentHash` does **not** match the registry's *current* hash
+for that skill (only possible across a process restart/redeploy that
+changed the skill's file between this run's first load and a later
+retry/re-entry) → throws a clear, structured `Error` naming both
+hashes, refusing to silently serve the new content in the old load's
+place. A concurrent duplicate insert (two racing calls for the same
+`agentRunId`+`skillName`) is caught via the same unique constraint,
+re-reads the row that landed, and returns it rather than erroring —
+verified with a real `Promise.all` of two concurrent `execute()` calls,
+not just reasoned about, same rigor as checkpoint 2.4's concurrency
+test. "Restore on retry/resume" is this DB row being authoritative, not
+an in-memory replay of prior tool-call history — the model simply calls
+`load_skill` again if it needs the instructions again, and the contract
+guarantees it always gets back the identical version.
+
+### Known limitations, stated plainly
+- Supporting assets are restricted to `.md` text files only — no
+  binary/image asset representation is implemented (narrower than the
+  "supported asset representation" language in the brief; this
+  checkpoint's actual three skills only need Markdown).
+- An already-loaded skill's full instructions are **not** automatically
+  re-injected into the base system prompt on a later round or after
+  re-entry — only name+description are ever in the base prompt; a model
+  that needs the instructions again simply calls `load_skill` again
+  (cheap, local, idempotent). This was a deliberate simplicity choice
+  over a second mechanism that would risk the exact thing the brief
+  warns against ("do not load every skill's full content into every
+  model request") at scale across many loaded skills.
+- No live OpenRouter call was used to verify a model actually chooses to
+  call `load_skill` for a relevant prompt — all progressive-loading
+  tests mock `callOpenRouter`, per this checkpoint's own "no live
+  OpenRouter/Magica calls" instruction. The first genuine live exercise
+  of this path is whatever real conversation happens to trigger it
+  after this checkpoint ships (see the "one consequence worth naming"
+  note at the top of this section).
 
 ## Pagination and search (checkpoint 1.3)
 - **Chat list:** `ORDER BY isPinned DESC, lastMessageAt DESC, id DESC`, keyset cursor on `(lastMessageAt, id)`. No index currently covers `isPinned` as a leading column — correct, not yet optimally indexed at scale; see decisions/0008.

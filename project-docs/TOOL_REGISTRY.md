@@ -21,4 +21,9 @@ Schema endpoint ignores `subModelId` param — query sub-model IDs (`gpt-image-2
 Error envelope (all endpoints): `{error, message, code, traceId}`. Documented codes: 400, 401, 403 (insufficient credits), 404, 410 (MODEL_RETIRED), 429, 500.
 
 ## Skills (minimum 3 required)
-Not yet implemented. `agent-skills/<name>/SKILL.md`, YAML `name`+`description`, loaded via typed `load_skill`/`read_skill_asset` tools only. See decisions/ once skill selection is made.
+**Implemented, checkpoint 2.5.** `agent-skills/{image-editing,video-editing,image-analysis}/SKILL.md`,
+YAML `name`+`description` frontmatter, discovered and validated at
+startup by `src/skills/registry.ts`, loaded on demand via the typed
+`load_skill`/`read_skill_asset` tools (`src/tools/skills.ts`) — now the
+first two real entries in `PRODUCTION_TOOL_REGISTRY`. Full detail:
+API_CONTRACTS.md's "Application-owned skills system" section.

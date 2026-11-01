@@ -2,7 +2,8 @@
 // 9 required entities only: User, CreditAccount, CreditLedger, Chat, Message,
 // AgentRun, ToolInvocation, Waitpoint, Attachment.
 // Deferred to a later checkpoint (not in this checkpoint's required list):
-// RunSkill (skills durability), full-text search index on Chat.
+// RunSkill (skills durability) — added in checkpoint 2.5, see below.
+// Full-text search index on Chat remains deferred.
 // See project-docs/decisions/0006-checkpoint-1.1-scope-trim.md
 
 generator client {
@@ -170,11 +171,30 @@ model AgentRun {
   messages        Message[]
   toolInvocations ToolInvocation[]
   waitpoints      Waitpoint[]
+  runSkills       RunSkill[]
 
   // One active run per chat — Prisma's schema language can't express a
   // partial unique index; enforced via raw SQL added to the generated
   // migration. See project-docs/DATABASE.md.
   @@index([chatId, createdAt])
+}
+
+// Checkpoint 2.5 — durable, per-run skill-loading state. Deferred since
+// checkpoint 1.1 (see the header comment above); introduced now that
+// progressive skill loading actually needs it. A normal composite
+// unique constraint (not a partial index like AgentRun/Message above)
+// — fully expressible in Prisma's own schema language, no hand-SQL
+// migration needed this time.
+model RunSkill {
+  id          String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  agentRunId  String   @db.Uuid
+  skillName   String
+  contentHash String
+  loadedAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  agentRun AgentRun @relation(fields: [agentRunId], references: [id])
+
+  @@unique([agentRunId, skillName])
 }
 
 enum ToolInvocationStatus {

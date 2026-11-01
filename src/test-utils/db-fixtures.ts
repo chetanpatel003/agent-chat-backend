@@ -28,6 +28,9 @@ export async function cleanupTestUsers(userIds: string[]) {
   await prisma.waitpoint.deleteMany({
     where: { agentRun: { userId: { in: userIds } } },
   });
+  await prisma.runSkill.deleteMany({
+    where: { agentRun: { userId: { in: userIds } } },
+  });
   await prisma.agentRun.deleteMany({ where });
   await prisma.message.deleteMany({ where });
   await prisma.chat.deleteMany({ where });

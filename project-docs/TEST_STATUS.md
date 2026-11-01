@@ -195,4 +195,123 @@ async-reject) ✓, terminal-state protection extended to
 COMPLETED/FAILED/CANCELLED ✓, duplicate-Idempotency-Key through the real
 route (not just the DB layer) ✓.
 
+| `pnpm typecheck` | checkpoint 2.5 | PASS |
+| `pnpm lint` | checkpoint 2.5 | PASS (no issues) |
+| `pnpm test` (Vitest) | checkpoint 2.5 | **202/204** (+56 new tests, all passing). 2 failures, both pre-existing tests from before this checkpoint, both environmental — see below. Reran the full suite twice and the one live-dispatch test in isolation; every new test this checkpoint added passed in every run, with no exceptions. |
+| `pnpm build` (production) | checkpoint 2.5 | PASS — no route changes (backend-internal checkpoint); routes unchanged from 2.4 |
+| Migration applied + verified | checkpoint 2.5 | PASS — `20261101135129_add_run_skill`; a normal Prisma-schema-declared composite unique constraint (not hand-SQL), confirmed via `prisma migrate status` → "Database schema is up to date." See DATABASE.md. |
+| Real Trigger.dev + real OpenRouter, end to end | checkpoint 2.5 | **PASS, proven directly in the worker log** — one real dispatch during this checkpoint's verification completed in 11.2s with output `{"status":"COMPLETED","skipped":false,"ambiguous":false}`, the correct shape. The production registry now sends `load_skill`/`read_skill_asset` tool definitions on every real call (Decision A amended) — this is the first checkpoint where a real conversation can see live tool-calling, not just the plain-text path. |
+
+**Two failures this run, both pre-existing tests, both environmental —
+not regressions, not new-test failures:**
+
+1. **`send-turn.test.ts`'s real end-to-end dispatch test** (fixed 20s
+   budget) timed out twice, including once in true isolation with the
+   Trigger.dev worker already warm. Investigated via the worker's own
+   log, not assumed: the *first* real dispatch in this same warm-worker
+   session completed cleanly in 11.2s with the exact correct output,
+   proving the pipeline itself is correct. The *second* attempt's own
+   first try took 15.8s just reaching its post-call guarded status
+   read, past the point where the test had already timed out and its
+   cleanup had already hard-deleted the AgentRun row — so the
+   observed failure mode (`PrismaClientKnownRequestError: ... No record
+   was found`, from `readAgentRunStatus`) is the background task
+   finding its own row already gone, a consequence of the test timing
+   out and cleaning up, not a cause of it. This test has essentially no
+   margin (~8s of its own Neon round trips before dispatch, against a
+   20s total budget, for a call to OpenRouter's inherently variable
+   free tier — PHASE2-PLAN.md's risk #2, named since the plan was
+   written) and was not modified or newly stressed by this checkpoint;
+   its timeout was left unchanged, since raising it would mask latency
+   sensitivity rather than fix anything, and touching this pre-existing
+   file's timeout value is outside this checkpoint's scope.
+2. **`run-agent-turn.test.ts`'s "cancelling while the provider call is
+   active"** — the exact same intermittent flake documented in
+   checkpoint 2.4's own TEST_STATUS.md entry above, reproduced with the
+   identical symptom (hook timeout at the configured ceiling) a third
+   time this session alone, across multiple reruns both before and
+   after this checkpoint's own code changes. Not touched or newly
+   stressed by checkpoint 2.5.
+
+**Coverage by this checkpoint's required test list** (registry 1-9,
+progressive loading 10-15, security 16-22, persistence/recovery 23-28,
+tool integration 29-33 — see the Phase 2.5 instructions):
+- **Registry** ✓ all 9: valid discovery, all 3 real skills discovered,
+  missing frontmatter, malformed YAML, missing name, missing
+  description, duplicate names, oversized files, invalid names
+  (`src/skills/registry.test.ts`).
+- **Progressive loading** ✓ all 6: metadata-only base prompt
+  (`src/skills/prompt.test.ts` + an integration assertion in
+  `run-agent-turn.test.ts`), a relevant skill loadable, an unrelated
+  skill never auto-loaded (`run-agent-turn.test.ts`), assets readable
+  after loading, unknown skills/assets rejected
+  (`src/tools/skills.test.ts`).
+- **Security** ✓ all 7: `../` traversal, absolute paths, encoded
+  traversal, symlink escape, unsupported extensions, oversized assets,
+  outside-the-skill-directory access — covered twice, once at the
+  `resolveApprovedAsset` unit level (`src/skills/paths.test.ts`) and
+  again through the real tool (`src/tools/skills.test.ts`), proving the
+  wiring and not just the resolver.
+- **Persistence and recovery** ✓ all 6: first load creates exactly one
+  `RunSkill` row, repeated load doesn't duplicate it, re-entry restores
+  the same version, the content hash stays stable, a changed skill file
+  fails loudly instead of silently swapping versions, two real
+  concurrent loads (`Promise.all`) never duplicate a record — verified
+  for real against the database, not reasoned about
+  (`src/tools/skills.test.ts`).
+- **Tool integration** ✓ all 5: both tools registered in
+  `PRODUCTION_TOOL_REGISTRY`, OpenRouter schemas generated from their
+  Zod schemas, `ToolInvocation` persisted correctly through the real
+  loop, invalid input/unknown-skill handled safely through the
+  *existing* mechanisms with zero new branches, all pre-existing
+  fixture-tool tests from checkpoint 2.3 still pass unmodified except
+  one necessary, precisely-scoped assertion update (the conversation-
+  context array now has a leading system message — asserted
+  structurally rather than loosened).
+
+| `pnpm typecheck` | checkpoint 3.1 | PASS |
+| `pnpm lint` | checkpoint 3.1 | PASS (no issues) |
+| `pnpm test` (Vitest) | checkpoint 3.1 | **214/215** (+11 new tests, all passing in every run). 1 failure, the exact same pre-existing, already-documented flake from checkpoint 2.4 ("cancelling while the provider call is active") — unrelated to this checkpoint's own changes, reproduced with the identical symptom across 4 separate full/partial reruns this checkpoint alone. |
+| `pnpm build` (production) | checkpoint 3.1 | PASS — no route changes (backend-internal checkpoint) |
+| Real Trigger.dev, live rebuild verification | checkpoint 3.1 | **PASS** — the dev worker auto-rebuilt cleanly after every source edit this checkpoint (confirmed in its own log: versions `.22` through `.29`), and one real dispatch completed correctly mid-checkpoint with the worker already warm. |
+
+**New tests by file:** `run-transitions.test.ts` +3 (`isAgentRunRecentlyActive`: fresh, stale, and re-reads-fresh-not-cached), `openrouter.test.ts` +2 (duplicate `tool_call` id, empty id — both rejected as `MALFORMED_RESPONSE`), `run-agent-turn.test.ts` +6 (2 in "turn limit": multi-tool-call cancellation on the final round, final-answer-on-the-last-round still succeeds; 4 in a new "liveness-guarded re-entry" describe block: fresh-PENDING-message backs off, fresh-RUNNING-ToolInvocation backs off, genuinely-stale-still-resolves-to-ambiguous, and the direct race reproduction).
+
+**Two pre-existing tests had their assertions updated to match a
+deliberately changed guarantee, not weakened:** the checkpoint-2.4
+concurrency test and the turn-limit test. The concurrency test now
+asserts the run always ends `COMPLETED` (previously `COMPLETED` *or*
+`FAILED`, "either is safe") — the liveness fix makes the race
+deterministic. Both race tests' "loser" assertions were corrected
+mid-checkpoint after an initial version assumed the backed-off
+execution's *returned* status would always equal the eventual final
+state; it doesn't (it's an accurate snapshot at the moment it backed
+off, taken via one of two different safe paths depending on exact
+interleaving) — caught by the tests actually failing on first run, not
+assumed correct. The turn-limit test now asserts the fixture tool's
+`execute()` is called exactly 7 times (not 8) and the 8th `ToolInvocation`
+is `CANCELLED`/`TURN_LIMIT_EXCEEDED`. Three more pre-existing tests
+(the 2.2 crash-recovery test, both reconcile tests) needed their
+simulated-crash state backdated (`backdateAgentRunActivity`, raw SQL —
+`@updatedAt` cannot be overridden via a normal Prisma `update()`,
+confirmed by trying) so they still represent a *genuinely* stale
+scenario under the new liveness check, rather than a moments-old one
+the fix would now (correctly) treat as possibly-still-alive.
+
+**Coverage by this checkpoint's required scope:**
+1. Max-round boundary ✓ — fixed, documented, 2 new tests + 1 existing
+   test's invocation-count/status assertions strengthened.
+2. Tool-call validation ✓ — duplicate/empty id rejected, 2 new tests.
+3. Invocation lifecycle ✓ — execution/persistence separated; no new
+   test needed beyond the existing full tool-calling suite continuing
+   to pass unchanged (the refactor is behavior-preserving on every
+   existing path; the only *new* observable behavior is on a
+   persistence-layer failure, which is not practical to trigger
+   deterministically in this test environment and is reasoned about,
+   not merely asserted, in API_CONTRACTS.md).
+4. Retry/idempotency ✓ — documented (API_CONTRACTS.md's new "Retry and
+   idempotency behavior" section); no code gap found beyond item 5.
+5. Concurrency race ✓ — reproduced deterministically, fixed, regression
+   test added, existing test's assertion strengthened to match.
+
 Update this table (don't narrate) after each phase's test step.

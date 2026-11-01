@@ -16,8 +16,12 @@ function makeTool(name: string): ToolDefinition<{ x: string }, { y: string }> {
 }
 
 describe("PRODUCTION_TOOL_REGISTRY", () => {
-  it("is empty — no tool is exposed to a real conversation in Phase 2 (Decision A)", () => {
-    expect(PRODUCTION_TOOL_REGISTRY.size).toBe(0);
+  // Decision A kept this empty through checkpoint 2.4. Checkpoint 2.5
+  // amends that narrowly: exactly the two skill-loading tools, nothing
+  // else — see src/tools/skills.test.ts for their own behavior.
+  it("contains exactly the two skill-loading tools added in checkpoint 2.5 — Decision A's amendment, not its reversal", () => {
+    expect(PRODUCTION_TOOL_REGISTRY.size).toBe(2);
+    expect([...PRODUCTION_TOOL_REGISTRY.keys()].sort()).toEqual(["load_skill", "read_skill_asset"]);
   });
 });
 

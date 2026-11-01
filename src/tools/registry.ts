@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { AnyToolDefinition, ToolRegistry } from "./types";
+import { loadSkillTool, readSkillAssetTool } from "./skills";
 
 export function createToolRegistry(tools: AnyToolDefinition[] = []): ToolRegistry {
   const map = new Map<string, AnyToolDefinition>();
@@ -13,13 +14,21 @@ export function createToolRegistry(tools: AnyToolDefinition[] = []): ToolRegistr
 }
 
 /**
- * The production registry. Empty by design, per Decision A in
- * project-docs/PHASE2-PLAN.md — no tool is exposed to a real conversation
- * until Phase 3 registers the real Magica tools into this exact
- * mechanism. executeAgentTurn() defaults to this; tests substitute their
+ * The production registry. Decision A (project-docs/PHASE2-PLAN.md)
+ * kept this empty through checkpoint 2.4 -- no tool exposed to a real
+ * conversation until Phase 3's Magica tools. Checkpoint 2.5 amends that
+ * narrowly and explicitly: the two skill-loading tools are real,
+ * low-risk, local-only capabilities (no external provider call, no
+ * credit charge, no business side effect) and this checkpoint's own
+ * instructions require registering them here. Magica/business tools
+ * remain out until Phase 3 -- this is not a general reopening of
+ * Decision A. executeAgentTurn() defaults to this; tests substitute their
  * own registry via its `registry` parameter and never mutate this one.
  */
-export const PRODUCTION_TOOL_REGISTRY: ToolRegistry = createToolRegistry();
+export const PRODUCTION_TOOL_REGISTRY: ToolRegistry = createToolRegistry([
+  loadSkillTool,
+  readSkillAssetTool,
+]);
 
 export type OpenRouterToolSpec = {
   type: "function";

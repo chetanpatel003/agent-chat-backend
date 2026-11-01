@@ -226,6 +226,16 @@ error *after* the PENDING insert, *before* the response update, then
 re-invoke and assert `AMBIGUOUS_PROVIDER_OUTCOME`, not a silent retry).
 **3h.**
 
+> **Status: done.** Implemented as designed above, with one refinement
+> decision C's own text made more precise mid-implementation: the
+> PENDING message is *preserved*, never flipped to FAILED, on an
+> ambiguous outcome — only the AgentRun transitions. Two real live
+> OpenRouter calls (free, cost 0) grounded the adapter's response-shape
+> handling rather than guessing from docs that don't document whether
+> `model` reflects actual routing or whether `content` can be null — see
+> decisions/0010. Time actually spent: see the checkpoint 2.2 completion
+> report for the honest breakdown against this 3h estimate.
+
 **2.3 — Tool-calling mechanism, fixture-only** *(critical path, per decision A)*
 Registry, Zod validation boundary, execute/persist/feed-back loop,
 turn-limit bound. The `reconcile()` interface is defined on the handler

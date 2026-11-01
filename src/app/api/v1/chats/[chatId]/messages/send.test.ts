@@ -1,8 +1,21 @@
+// This file tests HTTP wiring only (status codes, response shape,
+// header handling) — it has no need for a genuine Trigger.dev dispatch,
+// so the task's own `.trigger()` is mocked here. The one place a real
+// dispatch is deliberately exercised end to end is checkpoint 2.1's
+// send-turn.test.ts; letting *this* file also dispatch for real (as it
+// did before the task had real OpenRouter logic) meant every test run
+// burned real OpenRouter quota and left orphaned failed-retry runs in
+// Trigger.dev's dashboard once this test's own cleanup deleted the rows
+// before the async task's retries could finish — a real, avoidable cost,
+// not a correctness issue, but not worth paying repeatedly either.
 import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
 import { randomUUID } from "node:crypto";
 
 vi.mock("@clerk/backend", () => ({ verifyToken: vi.fn() }));
 vi.mock("@/lib/clerk", () => ({ clerkClient: { users: { getUser: vi.fn() } } }));
+vi.mock("@/trigger/run-agent-turn", () => ({
+  runAgentTurn: { trigger: vi.fn().mockResolvedValue({ id: `run_mocked_${randomUUID()}` }) },
+}));
 
 import { verifyToken } from "@clerk/backend";
 import { clerkClient } from "@/lib/clerk";
@@ -108,13 +121,10 @@ describe("POST /api/v1/chats/[chatId]/messages", () => {
       const activeRes = await getActiveRunRoute(activeReq, routeCtx(chat.id));
       expect(activeRes.status).toBe(200);
       const activeBody = await activeRes.json();
-      // Could already be COMPLETED by the time this runs (the dev worker
-      // is fast) — either a matching active run or null-because-finished
-      // both prove the wiring works; a 404/error would not.
-      if (activeBody.data) {
-        expect(activeBody.data.id).toBe(sendBody.data.runId);
-      }
+      // The task is mocked (never actually dispatched), so the run stays
+      // QUEUED — this is purely a wiring check, not a behavioral one.
+      expect(activeBody.data?.id).toBe(sendBody.data.runId);
+      expect(activeBody.data?.status).toBe("QUEUED");
     },
-    15000,
   );
 });

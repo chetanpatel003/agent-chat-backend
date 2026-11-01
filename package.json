@@ -1,0 +1,57 @@
+{
+  "name": "agent-chat-backend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3001",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "next typegen && tsc --noEmit",
+    "test": "vitest run",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "trigger:dev": "trigger dev",
+    "trigger:deploy": "trigger deploy",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@asteasolutions/zod-to-openapi": "^9.1.0",
+    "@clerk/backend": "^3.26.5",
+    "@clerk/nextjs": "7.9.23",
+    "@prisma/adapter-pg": "^7.10.1",
+    "@prisma/client": "7.10.1",
+    "@trigger.dev/sdk": "4.8.3",
+    "gray-matter": "^4.0.3",
+    "next": "16.4.3",
+    "openai": "^7.47.0",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "standardwebhooks": "^1.1.1",
+    "svix": "^2.9.1",
+    "zod": "4.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitest/coverage-v8": "^5.0.5",
+    "dotenv": "^18.0.9",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.3",
+    "msw": "^3.0.3",
+    "prisma": "7.10.1",
+    "trigger.dev": "4.8.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5",
+    "vitest": "^5.0.5"
+  },
+  "packageManager": "pnpm@10.34.9",
+  "engines": {
+    "node": ">=22.12"
+  }
+}

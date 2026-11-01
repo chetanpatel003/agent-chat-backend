@@ -1,8 +1,9 @@
 # API_CONTRACTS — actual request/response shapes
 
-**Status: core chat/message/credit read-and-write APIs implemented**
-(checkpoint 1.3), on top of checkpoint 1.2's auth/contract foundation.
-No message sending, agent execution, or credit charging yet — explicitly
+**Status: message sending + durable dispatch implemented** (checkpoint
+2.1 — stub task only, real OpenRouter call lands in 2.2), on top of
+checkpoint 1.3's chat/message/credit APIs. No real model call, tool
+execution, or credit charging yet — explicitly
 out of scope through checkpoint 1.3.
 
 ## Structure
@@ -19,6 +20,8 @@ never drift from the database's actual enum definitions.
 - `attachment.ts` — `AttachmentSourceSchema`, `AttachmentStatusSchema`, `AttachmentMetadataSchema`, `AttachmentResponseSchema`.
 - `credits.ts` — `CreditLedgerTypeSchema`, `CreditBalanceResponseSchema`, `CreditLedgerEntrySchema`, `PaginatedCreditLedgerResponseSchema`. Credit amounts are BigInt in Postgres, Number at the API boundary — converted in the service layer.
 - `enum-schema.ts` — shared `enumSchema()` helper deriving a Zod enum from a Prisma const-object enum.
+- `agent-run.ts` — **checkpoint 2.1 addition:** `AgentRunResponseSchema` (direct mirror of the AgentRun row), `WaitingReasonSchema`.
+- `message.ts` — **checkpoint 2.1 addition:** `SendMessageRequestSchema` (`{text}`, 1–8000 chars — plain text only, attachments out of scope), `SendMessageResponseSchema` (`{chatId, messageId, runId, triggerRunId}`).
 
 ## Routes implemented
 | Route | Method | Auth | Contract |
@@ -31,6 +34,8 @@ never drift from the database's actual enum definitions.
 | `/api/v1/chats/[chatId]` | PATCH | Clerk bearer + ownership | `UpdateChatRequestSchema` body (title and/or isPinned — one endpoint covers both "update title" and "pin/unpin") → `ChatResponseSchema` |
 | `/api/v1/chats/[chatId]` | DELETE | Clerk bearer + ownership | → `{ id }`. Soft delete (`isDeleted = true`); the chat is gone from listing/retrieval but never hard-deleted. |
 | `/api/v1/chats/[chatId]/messages` | GET | Clerk bearer + ownership | `CursorPaginationRequestSchema` query → `PaginatedMessageResponseSchema` |
+| `/api/v1/chats/[chatId]/messages` | POST | Clerk bearer + ownership | **New.** Requires an `Idempotency-Key` header (required, not optional — see below). `SendMessageRequestSchema` body → `SendMessageResponseSchema`, 202. |
+| `/api/v1/chats/[chatId]/runs/active` | GET | Clerk bearer + ownership | **New.** → `AgentRunResponseSchema \| null`. The reconciliation endpoint — "is something in flight for this chat right now." |
 | `/api/v1/credits/balance` | GET | Clerk bearer | → `CreditBalanceResponseSchema`. No account provisioned yet = 0, never auto-created by a GET. |
 | `/api/v1/credits/ledger` | GET | Clerk bearer | `CursorPaginationRequestSchema` query → `PaginatedCreditLedgerResponseSchema` |
 
@@ -46,6 +51,44 @@ checkpoint for consistency (re-tested, no behavior change).
 `src/lib/errors.ts#toErrorResponse` now also maps a raw `ZodError` to 400
 with a safe per-field message — every route's `.parse()` call needs no
 individual try/catch for that.
+
+## Send-turn: admission + durable dispatch (checkpoint 2.1)
+`src/services/send-turn.ts#sendTurn` — one transaction creates the user
+`Message` and the `AgentRun` together (`Message.agentRunId` is set for
+the user's own message too, a deliberate reuse of that column so an
+idempotent-replay lookup can find it — not just "the run that produced
+this message"), updates `Chat.lastMessageAt`, then — once committed —
+dispatches `run-agent-turn` via `.trigger()` with `AgentRun.idempotencyKey`
+as Trigger.dev's own idempotency key (`idempotencyKeyTTL: "24h"`,
+verified real against the installed SDK, not assumed — see
+`project-docs/PHASE2-PLAN.md`).
+
+**Idempotent retry:** a resend with the same `Idempotency-Key` header
+hits the `AgentRun.idempotencyKey` unique constraint; the catch branch
+re-reads and returns the original dispatch's result instead of erroring
+or duplicating. **Concurrent-send conflict:** a different send while a
+run is already active hits the partial unique index instead
+(`AgentRun_one_active_per_chat`) → 409. Distinguishing these two P2002
+cases was **empirically verified**, not guessed — the exact branch
+condition is in `decisions/0009`.
+
+**If `.trigger()` itself fails** (network, Trigger.dev outage) after the
+transaction already committed: the AgentRun is marked `FAILED` with
+`errorCode: "DISPATCH_FAILED"` and the error propagates — never a fake
+202 for a run nothing will process.
+
+**`src/trigger/run-agent-turn.ts`** is a **stub** this checkpoint: loads
+the run, exits immediately if already terminal (idempotent re-entry —
+written to match the real design in `PHASE2-PLAN.md`, not just this
+stub's needs), marks `RUNNING`, writes one hardcoded assistant message,
+updates `Chat.lastMessageAt`, marks `COMPLETED`. Checkpoint 2.2 replaces
+the middle of this with the real OpenRouter call and the
+PENDING-marker/ambiguous-outcome mechanism. **Verified running for real**
+against the Trigger.dev dev worker (`pnpm trigger:dev`, started for the
+first time this trial) — not just typechecked: a real dispatch produced
+a real `triggerRunId`, transitioned QUEUED→RUNNING→COMPLETED on its own,
+and persisted correctly; a second `.trigger()` call with the same
+idempotency key returned the identical run id.
 
 ## Pagination and search (checkpoint 1.3)
 - **Chat list:** `ORDER BY isPinned DESC, lastMessageAt DESC, id DESC`, keyset cursor on `(lastMessageAt, id)`. No index currently covers `isPinned` as a leading column — correct, not yet optimally indexed at scale; see decisions/0008.

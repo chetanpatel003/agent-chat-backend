@@ -29,10 +29,22 @@ export class ValidationError extends Error {
   }
 }
 
+/** A request that's otherwise valid conflicts with the current state of
+ * the resource — e.g. a chat already has an active run. The client can
+ * retry later or act on the existing state; it isn't a validation
+ * failure or an ownership issue. */
+export class ConflictError extends Error {
+  constructor(message = "Conflict") {
+    super(message);
+    this.name = "ConflictError";
+  }
+}
+
 const STATUS_BY_ERROR_NAME: Record<string, number> = {
   UnauthorizedError: 401,
   NotFoundError: 404,
   ValidationError: 400,
+  ConflictError: 409,
 };
 
 /** Maps a thrown error to a safe, non-leaking HTTP response. Anything not

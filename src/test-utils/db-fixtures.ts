@@ -15,10 +15,20 @@ export async function makeTestUser(label: string) {
 }
 
 /** Deletes everything created under the given user ids, in the order
- * ON DELETE RESTRICT requires (children before the User row itself). */
+ * ON DELETE RESTRICT requires (children before the User row itself).
+ * ToolInvocation/Waitpoint included defensively even though no test uses
+ * them yet (Phase 2 checkpoints after 2.1 will) — RESTRICT against
+ * AgentRun, so they'd block cleanup the first time something does. */
 export async function cleanupTestUsers(userIds: string[]) {
   if (!userIds.length) return;
   const where = { userId: { in: userIds } };
+  await prisma.toolInvocation.deleteMany({
+    where: { agentRun: { userId: { in: userIds } } },
+  });
+  await prisma.waitpoint.deleteMany({
+    where: { agentRun: { userId: { in: userIds } } },
+  });
+  await prisma.agentRun.deleteMany({ where });
   await prisma.message.deleteMany({ where });
   await prisma.chat.deleteMany({ where });
   await prisma.creditLedger.deleteMany({ where });

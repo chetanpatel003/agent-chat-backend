@@ -26,4 +26,21 @@
 - Credits: balance retrieval ✓ (no-account=0, real account, cross-user isolation), ledger pagination ✓, cross-user access rejection ✓ (isolation, since there's no separate resource id to probe).
 - General: missing/invalid auth ✓, invalid request parameters ✓ (out-of-range limit, empty-string title), consistent error responses ✓, no sensitive internals leaked ✓ (asserted no stack-trace pattern in two response bodies).
 
+| `pnpm typecheck` | checkpoint 2.1 | PASS |
+| `pnpm lint` | checkpoint 2.1 | PASS (no issues) — caught and fixed Trigger.dev's `.trigger/` dev-build output being linted as source (1560 false-positive problems); now excluded in `eslint.config.mjs`, already gitignored |
+| `pnpm test` (Vitest) | checkpoint 2.1 | **PASS — 74/74** (13 files: +3 new — services send-turn/agent-run, route-level send test). One transient Neon-cold-start flake on first run (decisions/0006), passed clean on rerun. |
+| `pnpm build` (production) | checkpoint 2.1 | PASS — `/api/v1/chats/[chatId]/messages` (POST) and `/api/v1/chats/[chatId]/runs/active` (GET) both registered correctly |
+| Real Trigger.dev dev-worker run | checkpoint 2.1 | **PASS — the actual, non-mocked pipeline.** `pnpm trigger:dev` run for the first time this trial; a real dispatch via `sendTurn()` produced a real `triggerRunId`, the task transitioned QUEUED→RUNNING→COMPLETED on its own, the stub assistant message and `Chat.lastMessageAt` persisted correctly, and a second `.trigger()` call with the same idempotency key returned the identical run id — Trigger.dev's own idempotency confirmed for real, not just from its docs. |
+
+**Precondition for a full green run:** `pnpm trigger:dev` must be running
+in a separate terminal — `send-turn.test.ts`'s happy-path test dispatches
+a real task and waits for the real dev worker. Without it, that one test
+times out after 20s rather than failing fast; every other test is
+unaffected. (Found this the hard way mid-checkpoint: stopped the worker
+for a `pnpm build` check, reran `pnpm test` without restarting it —
+confirmed it was exactly that, not a regression, by restarting the
+worker and getting 74/74 clean again.)
+
+**Coverage by checkpoint 2.1's test list:** admission transaction ✓, duplicate-send idempotency ✓ (same Idempotency-Key twice → one run, identical response, both at the service layer and through the real route), one-active-run 409 ✓, cross-user rejection ✓, invalid body ✓ (empty text, missing header), task completes in dev mode ✓ (the real end-to-end run above, plus an automated test waiting on the same real worker), status read-back ✓ (`GET .../runs/active`).
+
 Update this table (don't narrate) after each phase's test step.

@@ -23,6 +23,14 @@ optimally indexed at scale. See decisions/0008.
 (`src/lib/prisma.ts`, checkpoint 1.2) — the "not yet written" note below
 is stale as of this checkpoint.
 
+## Checkpoint 2.1 — no migration
+`Message.status = PENDING` (already existed) is now load-bearing — it's
+the "an attempt was made, outcome unknown" marker the whole crash-
+recovery design in `PHASE2-PLAN.md` depends on. Confirms the schema was
+shaped correctly for this before the field was ever used this way. Not
+exercised yet (checkpoint 2.1 is a stub task with no real external call
+to crash mid-flight) — checkpoint 2.2 is where this actually matters.
+
 ## Prisma CLI / Neon connectivity
 `prisma migrate dev`/`deploy` initially failed (`P1001`) against a cold Neon compute; migration was generated via `migrate diff --from-empty --to-schema` (no DB connection) and applied directly via `pg`, recorded into `_prisma_migrations` to match what `deploy` would have produced. Once compute was warm, `prisma migrate status` succeeded normally and confirmed the same state. Full writeup: decisions/0006.
 

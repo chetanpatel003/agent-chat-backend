@@ -319,11 +319,16 @@ describe("executeAgentTurn — tool calling", () => {
     expect(result.status).toBe("COMPLETED");
     expect(mockCallOpenRouter).toHaveBeenCalledTimes(2);
     expect(executeSpy).toHaveBeenCalledTimes(1);
-    expect(executeSpy).toHaveBeenCalledWith({ timezone: "UTC" }, { agentRunId: run.id, userId: owner.id });
-
     const invocation = await prisma.toolInvocation.findFirstOrThrow({
       where: { agentRunId: run.id },
     });
+    // Checkpoint 3.2: the already-created invocation's own id is now
+    // propagated into the execution context — asserted against the
+    // real persisted row's id, not just `expect.any(String)`.
+    expect(executeSpy).toHaveBeenCalledWith(
+      { timezone: "UTC" },
+      { agentRunId: run.id, userId: owner.id, invocationId: invocation.id },
+    );
     expect(invocation.status).toBe("COMPLETED");
     expect(invocation.toolName).toBe(FIXTURE_TOOL_NAME);
     expect(invocation.durationMs).toBeGreaterThanOrEqual(0);
@@ -585,12 +590,20 @@ describe("executeAgentTurn — tool re-entry and reconcile()", () => {
     expect(executeSpy).not.toHaveBeenCalled();
     expect(mockCallOpenRouter).not.toHaveBeenCalled();
     // Phase 2 has no real async tool to safely resume the loop against,
-    // so even a resolved reconcile() still ends the run here — see
-    // PHASE2-PLAN.md and run-agent-turn.ts's re-entry comment.
+    // so even a resolved reconcile() still ends the *run* ambiguous
+    // here — see PHASE2-PLAN.md and run-agent-turn.ts's re-entry
+    // comment. Checkpoint 3.2: the *ToolInvocation* itself is no
+    // longer left stranded RUNNING, though — its genuinely-completed
+    // result (from fixtureToolWithReconcile.reconcile()) is now
+    // captured and persisted, not discarded.
     expect(result.ambiguous).toBe(true);
 
     const updatedRun = await prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } });
     expect(updatedRun.status).toBe("FAILED");
+
+    const updatedInvocation = await prisma.toolInvocation.findUniqueOrThrow({ where: { id: staleInvocation.id } });
+    expect(updatedInvocation.status).toBe("COMPLETED");
+    expect(updatedInvocation.output).toEqual({ isoTime: "2026-01-01T00:00:00.000Z", timezone: "UTC" });
   });
 });
 

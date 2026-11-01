@@ -314,4 +314,86 @@ the fix would now (correctly) treat as possibly-still-alive.
 5. Concurrency race ✓ — reproduced deterministically, fixed, regression
    test added, existing test's assertion strengthened to match.
 
+| `pnpm typecheck` | checkpoint 3.2 | PASS |
+| `pnpm lint` | checkpoint 3.2 | PASS (no issues) |
+| `pnpm test` (Vitest) | checkpoint 3.2 | **261/262** (+47 new tests, all passing in every run). 1 failure, the exact same pre-existing checkpoint-2.4 flake ("cancelling while the provider call is active") — untouched by this checkpoint, reproduced identically. |
+| `pnpm build` (production) | checkpoint 3.2 | PASS — no route changes (backend-internal checkpoint) |
+| Real Trigger.dev, live rebuild verification | checkpoint 3.2 | **PASS** — the dev worker auto-rebuilt cleanly after every source edit (log shows versions through `.34`); no live Magica or OpenRouter calls were made for this checkpoint's own verification, per its explicit scope — every test mocks `@/providers/magica`. |
+
+**New tests by file:** `src/providers/magica.test.ts` +22 (valid/malformed
+202 and poll responses, all 5 documented statuses accepted plus an
+unrecognized one, HTTP 4xx/429/5xx classification — including the
+corrected 5xx-is-ambiguous case, pre-transmission vs. ambiguous network-
+error classification via a real `cause.code` check, missing-API-key
+fails closed with zero requests made, API key never appears in any
+thrown error). `src/services/magica-run.test.ts` +14
+(`persistProviderRunId`'s guard in both directions — applies, repeat-
+is-idempotent, refuses a conflicting value, does not apply when not
+RUNNING; `pollMagicaRunToCompletion`'s completed/failed/canceled/
+unknown-status/transient-retry/budget-exhausted/local-cancellation
+paths; `reconcileMagicaRun`'s real-poll and missing-`providerRunId`
+paths). `src/trigger/run-agent-turn.magica.test.ts` +11 (the full
+start→persist→poll→complete happy path through the real loop;
+multiple tool calls under one AgentRun never confused by `agentRunId`
+alone; ambiguous-start / definite-start-rejection / persistence-
+conflict-after-202 all proven not to resubmit; polling-budget-
+exhaustion through the real loop leaves the invocation RUNNING and the
+run backs off; reconciliation on re-entry for completed/failed/
+inconclusive/missing-`providerRunId`/already-terminal cases).
+
+**Two pre-existing tests updated for a deliberately changed guarantee,
+not weakened:** `fixtureToolWithReconcile`'s own reconcile test now
+asserts the `ToolInvocation` is persisted `COMPLETED` with the real
+recovered output (previously: discarded, unassertable). The fixture-
+tool round-trip test's `execute()` call-site assertion now includes
+`invocationId`, asserted against the real persisted row's id rather
+than loosened to `expect.any(String)`.
+
+**A genuine bug found and fixed during this checkpoint's own test
+runs, not assumed correct:** the first draft of the Magica fixture
+tool's `reconcile()` type-cast its raw output as `{result: unknown}`
+without actually wrapping it — the persisted shape silently diverged
+from what `execute()` itself produces. Caught by a failing integration
+test assertion (`{recovered: true}` persisted instead of the expected
+`{result: {recovered: true}}`), not assumed; fixed by wrapping for
+real rather than loosening the assertion to match the bug.
+
+**A real, reproducible test-design bug found and fixed while writing
+this checkpoint's own new tests:** two `persistProviderRunId` tests
+reused the literal string `"magica_run_abc"` as a `providerRunId` for
+*different* invocation rows — `ToolInvocation.providerRunId` is
+globally `@unique`, so the second write collided with the first's,
+independent of any logic in `persistProviderRunId` itself (confirmed
+by reading the actual Prisma error, not assumed). Fixed by generating
+a fresh `providerRunId` per test. A second, related issue — the
+60-attempt budget-exhaustion test's own ~20s real-Neon-round-trip cost
+exceeded the default test timeout and left its background loop still
+running into the next test, leaking one stray mock call — fixed by
+raising that one test's timeout (same pattern as the turn-limit test's
+own precedent), not by papering over the leak.
+
+**Coverage by this checkpoint's required scope:**
+1. Magica provider adapter ✓ — `startMagicaRun`/`getMagicaRun`,
+   Zod-validated, corrected failure classification, 22 tests.
+2. `ToolExecutionContext.invocationId` ✓ — required, propagated at the
+   one real call site, 21 test call sites updated (the actual count,
+   verified by the typecheck error count — not the earlier
+   inspection's estimate of 15).
+3. `providerRunId` persistence ✓ — guarded both directions, persisted
+   before the first wait, proven through the real loop.
+4. Durable polling ✓ — bounded by attempt count and elapsed time,
+   using an injectable `wait.for()` (required — the real primitive
+   throws outside a live task context, and a wait of 5000ms or less
+   doesn't actually checkpoint; see decisions/0012), both verified
+   from the installed SDK's own source, not assumed.
+5. `reconcile()` result handling ✓ — captured and persisted instead of
+   discarded; terminal invocations never overwritten; still-
+   inconclusive preserved as RUNNING; AgentRun-level loop resumption
+   explicitly not attempted, per scope.
+6. Ambiguous-start failure handling ✓ — the corrected classification
+   table implemented exactly; every ambiguous/definite path proven,
+   through the real loop, to never automatically resubmit a start.
+7. Tests ✓ — 47 new, all passing; mocked throughout, no live Magica or
+   OpenRouter call made.
+
 Update this table (don't narrate) after each phase's test step.

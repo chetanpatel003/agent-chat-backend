@@ -742,3 +742,183 @@ response) and `OPENROUTER_MODEL` — must be exactly `openrouter/free`; the
 adapter refuses to make a request with any other value, with no paid
 fallback. Both already present in `.env.example` with placeholder values
 from the original project setup; no new variables added this checkpoint.
+
+## Magica provider adapter and execution-framework plumbing (checkpoint 3.2)
+
+**No production tool is registered yet.** This checkpoint builds and
+tests the Magica start/poll/persist/reconcile machinery in isolation,
+exercised only through a test-only fixture tool
+(`src/test-utils/magica-fixture-tool.ts`, never in
+`PRODUCTION_TOOL_REGISTRY`). Crop Image, GPT Image 2, and Merge Videos
+remain unregistered — that's the next checkpoint, built on top of what
+follows.
+
+### `src/providers/magica.ts` — the HTTP adapter
+`startMagicaRun(nodeType, input, subModelId?)` (`POST
+/v1/nodes/{nodeType}/run`) and `getMagicaRun(runId)` (`GET
+/v1/nodes/runs/{runId}`), mirroring `openrouter.ts`'s own shape exactly:
+`MagicaDefiniteError`/`MagicaAmbiguousError`, Zod-validated
+request/response bodies, a 30s per-call timeout. `MAGICA_BASE_URL`
+(env, optional) defaults to the documented
+`https://inference.magica.com`; `MAGICA_API_KEY` is read once per call,
+never logged, never included in any thrown error's message (tested
+directly — `magica.test.ts`'s "never includes the API key" cases).
+
+**Poll response status is intentionally not a `z.enum`** — the schema
+accepts any string for `status`, so an unrecognized value (Magica's
+own docs hedge the documented list with "such as") fails nothing at
+the validation layer; callers decide what to do with it.
+
+### Corrected start-request failure classification
+The Phase 3.2 architecture inspection's own first-draft table was
+corrected before implementation (its own follow-up investigation found
+the error): an HTTP 5xx does **not** prove Magica never started the
+job, and a network timeout/reset after the request may have already
+been transmitted is not provably "nothing happened." Implemented
+precisely in `classifyNetworkError`/`classifyHttpStatus`
+(`magica.ts`):
+
+| Outcome | Classification | Reasoning |
+|---|---|---|
+| Connection refused / DNS failure (`ECONNREFUSED`/`ENOTFOUND`/`EAI_AGAIN` on the fetch error's `cause.code`) | `MagicaDefiniteError` — safe to treat as not started | The only case the implementation can *reliably establish* happened before any bytes were sent |
+| Any other network error (our own timeout, `ECONNRESET`, anything without a recognized pre-transmission code) | `MagicaAmbiguousError` | Cannot be proven to predate transmission |
+| HTTP 4xx | `MagicaDefiniteError` | Inferred from REST convention (not documented by Magica) that validation rejections precede job creation; retrying wouldn't help regardless |
+| HTTP 429 | `MagicaDefiniteError`, code `RATE_LIMITED` | Same inference as 4xx |
+| HTTP 5xx | `MagicaAmbiguousError` — **corrected from the original draft table** | Can occur after the backend already enqueued the job |
+| 202 with an unparseable body | `MagicaAmbiguousError` | 202 itself means the run started; only the tracking id was lost |
+
+**The core rule, enforced structurally, not just by convention:** every
+ambiguous classification above funnels into a plain thrown
+`MagicaAmbiguousError`/a persistence failure — neither
+`src/services/magica-run.ts` nor the fixture tool contains any retry-
+the-start-request code path at all. There is nothing to disable; it
+was never built.
+
+### `src/tools/types.ts` — two contract changes
+- **`ToolExecutionContext.invocationId`** (required): the actual
+  current count was 21 call sites in `src/tools/skills.test.ts`
+  (not 15, the earlier inspection's estimate — corrected once the real
+  typecheck errors were counted, not re-estimated).
+  `agentRunId` alone cannot disambiguate which `ToolInvocation` row a
+  provider-backed tool should write `providerRunId` onto when more
+  than one tool call exists under the same run — proven by the
+  "multiple tool calls share one AgentRun" integration test.
+- **`reconcile()`'s return type** narrowed from `Promise<TOutput |
+  null>` to `Promise<{status:"completed";output}|{status:"failed";
+  errorCode;errorMessage}>`. A third outcome — "still can't tell" —
+  is deliberately *not* a return variant; it's signaled by *throwing*
+  `MagicaPollInconclusiveError` instead, so `execute()` and
+  `reconcile()` share one signaling convention. `fixtureToolWithReconcile`
+  (`src/test-utils/fixture-tool.ts`) updated to match.
+
+### The reconciliation control-flow fix (closes the gap the follow-up inspection traced exactly)
+Before this checkpoint, `run-agent-turn.ts`'s stale-`ToolInvocation`
+branch called `reconcile()` and **unconditionally discarded its return
+value**, then always marked the run ambiguous — a genuinely-completed
+remote result, if `reconcile()` found one, was thrown away with no
+trace beyond `providerRunId` itself. Now: the result is captured; a
+`"completed"`/`"failed"` outcome is persisted onto the `ToolInvocation`
+via a guarded `updateMany` (`where: {status: "RUNNING"}` — a terminal
+row is never overwritten); any throw (including, but not limited to,
+`MagicaPollInconclusiveError`) is still treated the same conservative
+way as before — leave the row exactly as it is. **The `AgentRun` still
+ends ambiguous either way** — resuming the OpenRouter conversation
+with the recovered result is explicitly out of this checkpoint's
+scope; see `fixtureToolWithReconcile`'s own test for the now-asserted
+persisted-`COMPLETED` behavior.
+
+### `src/services/magica-run.ts` — persistence and durable polling
+- **`persistProviderRunId(invocationId, providerRunId)`** — guarded
+  `updateMany({where: {id, status: "RUNNING", providerRunId: null}})`.
+  A repeat of the identical value is reported `applied: true` (no-op,
+  safe); a *different* existing value is refused, never overwritten.
+  Called immediately after Magica's `202`, before any poll or wait, in
+  the fixture tool's own `execute()` — proven by the "providerRunId
+  persisted before first wait" integration test.
+- **`pollMagicaRunToCompletion({agentRunId, providerRunId, waitFn?})`**
+  — bounded by both `MAGICA_POLL_MAX_ATTEMPTS` (60) and
+  `MAGICA_POLL_MAX_ELAPSED_MS` (5 minutes), using Trigger.dev's
+  `wait.for()` between attempts. **`MAGICA_POLL_INTERVAL_SECONDS` is
+  10, not a smaller value** — see decisions/0012: a `wait.for()` call
+  of 5000ms or less is a plain in-process `setTimeout`, not a real
+  platform checkpoint, confirmed by reading the installed SDK's own
+  runtime source. Every poll failure is retried within budget (never
+  surfaced as a run failure); an unrecognized status is retried the
+  same way, never silently mapped to `FAILED`/`COMPLETED`. Also checks
+  `readAgentRunStatus` between attempts and stops promptly (without
+  claiming Magica itself stopped) if the local run is no longer
+  `RUNNING` — reuses the existing primitive, no new plumbing. Budget
+  exhaustion throws `MagicaPollInconclusiveError`.
+- **`reconcileMagicaRun(invocation, waitFn?)`** — never calls the
+  start endpoint. A missing `providerRunId` (the one case the Phase
+  3.2 inspection identified as genuinely unrecoverable — a crash
+  between Magica's `202` and the local persist) throws
+  `MagicaPollInconclusiveError` immediately, before touching the
+  network at all.
+- **`DurableWait`** — `wait.for()` itself throws outside a live
+  Trigger.dev task context (same category of problem checkpoint 2.4
+  found with `metadata.append()` — see decisions/0012). Every polling
+  function takes an injectable `waitFn`, defaulting to the real
+  primitive; tests inject a fast no-op.
+
+### The max-round-boundary-style safety valve: `MagicaPollInconclusiveError`
+Recognized at exactly two points, both in `run-agent-turn.ts`, and
+nowhere else:
+1. Inside `runOneToolCall`'s outcome-capturing try/catch — rethrown
+   immediately, **never** persisted as `FAILED` (unlike every other
+   thrown error, which becomes `EXECUTION_FAILED`).
+2. In the main loop's per-tool-call wrapper around `runOneToolCall` —
+   caught, and the whole execution attempt backs off
+   (`{status, skipped: true, ambiguous: false}`) without writing
+   anything further, the same "write nothing, let a later re-entry
+   handle it" principle already used by the liveness guard
+   (checkpoint 3.1) and the terminal-state checks (checkpoint 2.4).
+   **This is not conversation-loop resumption** — the execution simply
+   ends here, exactly as a crash would, relying entirely on the
+   *existing* re-entry/`reconcile()` mechanism to pick it up later.
+
+### Item 8 — Trigger.dev's task-level `AbortSignal`: investigated, not wired in
+The Phase 3.2 inspection verified `@trigger.dev/core/.../types/
+tasks.d.ts`'s `RunFnParams = {ctx, init?, signal: AbortSignal}` — a
+real, sibling-of-`ctx` signal that fires on `maxDuration` or
+cancellation, confirmed never captured anywhere in this codebase
+(`grep -rn "AbortSignal" src/` → only `openrouter.ts`'s own unrelated,
+per-call `AbortController`). **Not wired in this checkpoint**: doing so
+cleanly would require widening `executeAgentTurn`'s positional-
+parameter signature (a 5th parameter, or restructuring to an options
+object) to thread it through `runOneToolCall` into
+`ToolExecutionContext` — which touches every existing test call site
+across `run-agent-turn.test.ts`, the exact "broader change" this
+checkpoint's own instructions said to document instead of forcing in.
+Local cancellation during polling is instead already handled by
+`pollMagicaRunToCompletion`'s own `readAgentRunStatus` check (above) —
+reusing the *existing* mechanism achieves the same practical goal
+(stop polling promptly on cancellation) without the signature change.
+
+### Known, accepted limitation — exactly-once is not achievable for two cases
+Unchanged from the Phase 3.2 architecture inspection, now encoded in
+code rather than just documented: a start request whose response is
+lost (network failure after transmission may have begun, or an HTTP
+5xx) and a `202` whose `runId` is received but never durably persisted
+are both **permanently unrecoverable** with Magica's currently-
+documented API (no idempotency key, no lookup-by-client-id). Both
+funnel into the same conservative behavior: never retry the start,
+record the ambiguity honestly (`FAILED`/`EXECUTION_FAILED` for the
+in-process case; the invocation is left exactly as it was for the
+crash-before-persist case), never invent a recovery mechanism Magica's
+API doesn't support.
+
+### No credit settlement, no webhooks, no new tables
+Per this checkpoint's explicit scope: no credit estimation or ledger
+entry is created for any Magica run (that's a separate, later
+checkpoint); Magica's `webhook` request parameter is never populated
+(polling only); no new Prisma model or migration — `providerRunId`/
+`triggerTaskRunId` on `ToolInvocation` already existed since
+checkpoint 1.1 and are the only columns used.
+
+### Required environment variables
+`MAGICA_API_KEY` (server-only, never logged) and `MAGICA_BASE_URL`
+(optional, defaults to `https://inference.magica.com`) — both already
+present in `.env.example` from the original project setup (same as
+`OPENROUTER_API_KEY`/`OPENROUTER_MODEL` were); no `.env.example` change
+needed this checkpoint.

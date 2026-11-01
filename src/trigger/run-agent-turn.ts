@@ -14,6 +14,7 @@ import { buildConversationContext } from "@/providers/conversation-context";
 import { PRODUCTION_TOOL_REGISTRY, toOpenRouterTools } from "@/tools/registry";
 import type { ToolRegistry } from "@/tools/types";
 import type { ContentBlock } from "@/contracts/message";
+import { MagicaPollInconclusiveError } from "@/providers/magica";
 import { PRODUCTION_SKILL_REGISTRY, listSkillMetadata } from "@/skills/registry";
 import { buildSkillSystemPrompt } from "@/skills/prompt";
 import type { SkillRegistry } from "@/skills/types";
@@ -408,7 +409,7 @@ async function runOneToolCall(params: {
   const startedAt = Date.now();
   let outcome: { ok: true; output: unknown } | { ok: false; errorCode: string; errorMessage: string };
   try {
-    const rawOutput = await tool.execute(parsedInput.data, { agentRunId, userId });
+    const rawOutput = await tool.execute(parsedInput.data, { agentRunId, userId, invocationId: invocation.id });
     const parsedOutput = tool.outputSchema.safeParse(rawOutput);
     outcome = parsedOutput.success
       ? { ok: true, output: parsedOutput.data }
@@ -418,6 +419,14 @@ async function runOneToolCall(params: {
           errorMessage: `Tool returned output that didn't match its declared schema: ${parsedOutput.error.message}`,
         };
   } catch (error) {
+    // A Magica-backed tool's execute() throws this one specific type to
+    // mean "still can't tell, leave the invocation exactly as it is" —
+    // never a genuine execution failure. Rethrown here, uncaught by
+    // this function, so it reaches the main loop's own handling
+    // (below) rather than being persisted as FAILED — the invocation
+    // stays RUNNING (with providerRunId intact, if one was already
+    // persisted) for a later reconciliation attempt to pick up.
+    if (error instanceof MagicaPollInconclusiveError) throw error;
     outcome = {
       ok: false,
       errorCode: "EXECUTION_FAILED",
@@ -569,12 +578,31 @@ export async function executeAgentTurn(
     }
     const tool = registry.get(staleToolInvocation.toolName);
     if (tool?.reconcile) {
-      await tool
-        .reconcile({
-          id: staleToolInvocation.id,
-          providerRunId: staleToolInvocation.providerRunId,
-        })
+      // The result is now captured and persisted — previously it was
+      // discarded unconditionally (see API_CONTRACTS.md's checkpoint
+      // 3.2 note). Any throw (including MagicaPollInconclusiveError,
+      // but treated identically for any other error too, same
+      // conservative swallow as before) means "still can't tell" —
+      // the invocation is left exactly as it is, guarded updates below
+      // never run. Resolving to "completed" or "failed" persists that
+      // outcome onto the ToolInvocation — guarded so a terminal row is
+      // never overwritten — but the AgentRun still ends ambiguous
+      // either way: resuming the OpenRouter conversation with the
+      // recovered result is explicitly out of this checkpoint's scope.
+      const reconciled = await tool
+        .reconcile({ id: staleToolInvocation.id, providerRunId: staleToolInvocation.providerRunId })
         .catch(() => null);
+      if (reconciled?.status === "completed") {
+        await prisma.toolInvocation.updateMany({
+          where: { id: staleToolInvocation.id, status: "RUNNING" },
+          data: { status: "COMPLETED", output: reconciled.output as Prisma.InputJsonValue },
+        });
+      } else if (reconciled?.status === "failed") {
+        await prisma.toolInvocation.updateMany({
+          where: { id: staleToolInvocation.id, status: "RUNNING" },
+          data: { status: "FAILED", errorCode: reconciled.errorCode, errorMessage: reconciled.errorMessage },
+        });
+      }
     }
     return ambiguousOutcome(run.id, emit);
   }
@@ -769,14 +797,30 @@ export async function executeAgentTurn(
         return { status: beforeTool, skipped: true as const, ambiguous: false as const };
       }
 
-      const outcome = await runOneToolCall({
-        toolCall,
-        registry,
-        agentRunId: run.id,
-        userId: run.userId,
-        messageId: pendingMessage.id,
-        emit,
-      });
+      let outcome: ToolCallOutcome;
+      try {
+        outcome = await runOneToolCall({
+          toolCall,
+          registry,
+          agentRunId: run.id,
+          userId: run.userId,
+          messageId: pendingMessage.id,
+          emit,
+        });
+      } catch (error) {
+        // A Magica-backed tool's execute() exhausted its own polling
+        // budget (or the run was cancelled mid-poll) — genuinely still
+        // can't tell the outcome. The ToolInvocation is left exactly
+        // as runOneToolCall left it (RUNNING, providerRunId intact if
+        // persisted) — back off the same way every other mid-round
+        // guard loss does: write nothing further, let a later
+        // re-entry's reconcile() pick this up. Not a loop resumption —
+        // this execution attempt simply ends here.
+        if (error instanceof MagicaPollInconclusiveError) {
+          return { status: await readAgentRunStatus(run.id), skipped: true as const, ambiguous: false as const };
+        }
+        throw error;
+      }
       content.push(...outcome.blocks);
       turnMessages.push(outcome.providerMessage);
 

@@ -55,7 +55,7 @@ describe("load_skill", () => {
     const run = await setUpRun(owner.id);
     const tool = createLoadSkillTool(fixtureRegistry());
 
-    const result = await tool.execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id });
+    const result = await tool.execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() });
 
     expect(result.name).toBe("fixture-skill");
     expect(result.description).toBe("A fixture skill for tool tests.");
@@ -74,10 +74,10 @@ describe("load_skill", () => {
     const run = await setUpRun(owner.id);
     const tool = createLoadSkillTool(fixtureRegistry());
 
-    const first = await tool.execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id });
+    const first = await tool.execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() });
     expect(first.previouslyLoaded).toBe(false);
 
-    const second = await tool.execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id });
+    const second = await tool.execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() });
     expect(second.previouslyLoaded).toBe(true);
     expect(second.contentHash).toBe(first.contentHash);
     expect(second.instructions).toBe(first.instructions);
@@ -93,7 +93,7 @@ describe("load_skill", () => {
 
     const firstEntry = await createLoadSkillTool(registry).execute(
       { name: "fixture-skill" },
-      { agentRunId: run.id, userId: owner.id },
+      { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() },
     );
 
     // Simulate re-entry: a brand new tool instance (as a fresh process
@@ -101,7 +101,7 @@ describe("load_skill", () => {
     // content, same agentRunId.
     const reentry = await createLoadSkillTool(registry).execute(
       { name: "fixture-skill" },
-      { agentRunId: run.id, userId: owner.id },
+      { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() },
     );
 
     expect(reentry.previouslyLoaded).toBe(true);
@@ -122,7 +122,7 @@ describe("load_skill", () => {
     });
 
     const tool = createLoadSkillTool(fixtureRegistry());
-    await expect(tool.execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id })).rejects.toThrow(
+    await expect(tool.execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() })).rejects.toThrow(
       /changed since this run first loaded it/,
     );
 
@@ -139,8 +139,8 @@ describe("load_skill", () => {
     const registry = fixtureRegistry();
 
     const [a, b] = await Promise.all([
-      createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id }),
-      createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id }),
+      createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() }),
+      createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() }),
     ]);
 
     expect(a.contentHash).toBe(b.contentHash);
@@ -154,7 +154,7 @@ describe("load_skill", () => {
     const tool = createLoadSkillTool(fixtureRegistry());
 
     await expect(
-      tool.execute({ name: "no-such-skill" }, { agentRunId: run.id, userId: owner.id }),
+      tool.execute({ name: "no-such-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() }),
     ).rejects.toThrow(/No skill named/);
 
     expect(await prisma.runSkill.count({ where: { agentRunId: run.id } })).toBe(0);
@@ -166,11 +166,11 @@ describe("read_skill_asset", () => {
     const owner = await user("read-asset-ok");
     const run = await setUpRun(owner.id);
     const registry = fixtureRegistry();
-    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id });
+    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() });
 
     const result = await createReadSkillAssetTool(registry).execute(
       { skillName: "fixture-skill", assetPath: "guides/extra.md" },
-      { agentRunId: run.id, userId: owner.id },
+      { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() },
     );
 
     expect(result.content).toBe("Fixture supporting guidance.\n");
@@ -186,7 +186,7 @@ describe("read_skill_asset", () => {
     await expect(
       createReadSkillAssetTool(registry).execute(
         { skillName: "fixture-skill", assetPath: "guides/extra.md" },
-        { agentRunId: run.id, userId: owner.id },
+        { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() },
       ),
     ).rejects.toThrow(/must be loaded with load_skill/);
   });
@@ -197,7 +197,7 @@ describe("read_skill_asset", () => {
     await expect(
       createReadSkillAssetTool(fixtureRegistry()).execute(
         { skillName: "no-such-skill", assetPath: "guides/extra.md" },
-        { agentRunId: run.id, userId: owner.id },
+        { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() },
       ),
     ).rejects.toThrow(/No skill named/);
   });
@@ -206,12 +206,12 @@ describe("read_skill_asset", () => {
     const owner = await user("read-asset-unknown-asset");
     const run = await setUpRun(owner.id);
     const registry = fixtureRegistry();
-    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id });
+    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() });
 
     await expect(
       createReadSkillAssetTool(registry).execute(
         { skillName: "fixture-skill", assetPath: "guides/does-not-exist.md" },
-        { agentRunId: run.id, userId: owner.id },
+        { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() },
       ),
     ).rejects.toThrow(/No asset named/);
   });
@@ -220,12 +220,12 @@ describe("read_skill_asset", () => {
     const owner = await user("read-asset-traversal");
     const run = await setUpRun(owner.id);
     const registry = fixtureRegistry();
-    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id });
+    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() });
 
     await expect(
       createReadSkillAssetTool(registry).execute(
         { skillName: "fixture-skill", assetPath: "../../../../etc/passwd" },
-        { agentRunId: run.id, userId: owner.id },
+        { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() },
       ),
     ).rejects.toThrow(/No asset named/);
   });
@@ -234,12 +234,12 @@ describe("read_skill_asset", () => {
     const owner = await user("read-asset-absolute");
     const run = await setUpRun(owner.id);
     const registry = fixtureRegistry();
-    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id });
+    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() });
 
     await expect(
       createReadSkillAssetTool(registry).execute(
         { skillName: "fixture-skill", assetPath: "/etc/passwd" },
-        { agentRunId: run.id, userId: owner.id },
+        { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() },
       ),
     ).rejects.toThrow(/No asset named/);
   });
@@ -250,12 +250,12 @@ describe("read_skill_asset", () => {
     const registry = fixtureRegistry();
     const skill = registry.get("fixture-skill")!;
     fs.writeFileSync(path.join(skill.dir, "notes.txt"), "plain text\n");
-    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id });
+    await createLoadSkillTool(registry).execute({ name: "fixture-skill" }, { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() });
 
     await expect(
       createReadSkillAssetTool(registry).execute(
         { skillName: "fixture-skill", assetPath: "notes.txt" },
-        { agentRunId: run.id, userId: owner.id },
+        { agentRunId: run.id, userId: owner.id, invocationId: randomUUID() },
       ),
     ).rejects.toThrow(/No asset named/);
   });

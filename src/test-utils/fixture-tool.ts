@@ -49,12 +49,14 @@ export const fixtureTool: ToolDefinition<FixtureToolInput, FixtureToolOutput> = 
  * dormant-path test suite," since nothing in Phase 2 has a real async
  * tool to safely resume a loop against). Simulates a Magica-style
  * external run that actually completed, confirmed by polling, despite
- * our own row never being updated before a crash.
+ * our own row never being updated before a crash. Return shape updated
+ * in checkpoint 3.2 to `ToolReconcileOutcome` (`{status:"completed",
+ * output}` — the caller now persists this instead of discarding it).
  */
 export const fixtureToolWithReconcile: ToolDefinition<FixtureToolInput, FixtureToolOutput> = {
   ...fixtureTool,
   name: "get_current_time_reconcilable",
   async reconcile() {
-    return { isoTime: "2026-01-01T00:00:00.000Z", timezone: "UTC" };
+    return { status: "completed" as const, output: { isoTime: "2026-01-01T00:00:00.000Z", timezone: "UTC" } };
   },
 };

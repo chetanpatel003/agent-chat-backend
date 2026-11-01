@@ -264,6 +264,59 @@ exercise the call sites) — proportionate given decision B's "keep it
 simple."
 **2.5h.**
 
+> **Status: done.** Delivered scope expanded beyond this section's own
+> text, per more detailed follow-up instructions received when this
+> checkpoint started (overriding the trim above and this plan's original
+> "cancellation funnels into the ambiguous-outcome path" framing):
+> - Every AgentRun status write is now a guarded CAS
+>   (`src/services/run-transitions.ts`), not a plain `update()` — not
+>   originally scoped at this granularity, added because cancellation
+>   needs a race-safe way to coexist with the worker's own writes.
+> - Terminal Message+Chat+AgentRun writes are atomic `$transaction`s,
+>   each guarded by the message still being PENDING.
+> - A new partial unique index (`Message_one_assistant_per_run`,
+>   DATABASE.md) makes "one assistant message per run" database-enforced
+>   and doubles as the real mutex for two genuinely concurrent
+>   `executeAgentTurn()` calls — proven with an actual `Promise.all` race,
+>   not just reasoned about.
+> - Cancellation (`POST .../runs/[runId]/cancel`, `src/services/agent-run.ts#cancelRun`)
+>   ends in `CANCELLED`, a distinct outcome from `AMBIGUOUS_PROVIDER_OUTCOME`
+>   — not funneled into the ambiguous path as originally planned, since a
+>   cancel is a *known*, deliberate transition, not an unknown outcome.
+>   AbortSignal was investigated and found unavailable for a plain
+>   `task({run})`'s context in the installed SDK (verified by reading
+>   `TaskRunContext`'s schema directly); cancellation is instead caught
+>   by guarded status reads before/after the provider call and before
+>   each tool call, not by interrupting the in-flight request.
+> - The RunEvent contract's `assistant_text` variant became
+>   `assistant_message` (a pointer to `messageId`, never content), per
+>   the same follow-up instructions, and the "no dedicated variant test"
+>   trim above was reversed — `run-event.test.ts` tests every variant
+>   plus an explicit "content field rejected" case (`z.strictObject()`,
+>   not silent stripping).
+> - Additional tests beyond the three originally named: publish-after-
+>   commit (a spy that reads the DB inside its own callback), publisher-
+>   failure isolation (sync-throw and async-reject), and terminal-state
+>   protection extended to FAILED/CANCELLED, not just COMPLETED.
+> - The concurrency test itself surfaced a real, narrow race (a "losing"
+>   execution can mark the run ambiguous based on the "winner's"
+>   legitimately in-progress message) — documented as an accepted
+>   trade-off in API_CONTRACTS.md rather than fixed, since a real fix
+>   needs genuine liveness information this design doesn't have, and
+>   Trigger.dev's own idempotency means it essentially can't happen
+>   between separate real dispatches.
+> - One cancellation test ("provider call active") is intermittently
+>   flaky in this environment — confirmed via direct, timestamped
+>   diagnostics that the underlying code computes the exactly-correct
+>   result; the flakiness traces to Neon connection/latency variance
+>   under this session's many consecutive full-suite runs (an unrelated,
+>   untouched checkpoint-1.3 test timed out in the same run as
+>   independent evidence), not a logic defect. See the completion
+>   report for the exact pass/fail state at time of reporting.
+> Time actually spent: see the checkpoint 2.4 completion report for the
+> honest breakdown against this 2.5h estimate — expanded scope took
+> longer than the original text alone would have.
+
 **2.5 — Final verification + docs**
 Full test/typecheck/lint/build both repos; DATABASE.md (confirms no
 migration), API_CONTRACTS.md, TOOL_REGISTRY.md ("mechanism implemented,

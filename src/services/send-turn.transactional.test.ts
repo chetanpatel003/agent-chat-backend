@@ -11,7 +11,12 @@ import { describe, it, expect, vi, afterAll } from "vitest";
 import { randomUUID } from "node:crypto";
 
 vi.mock("@/trigger/run-agent-turn", () => ({
-  runAgentTurn: { trigger: vi.fn().mockResolvedValue({ id: `run_mocked_${randomUUID()}` }) },
+  // A fresh id per call, not one fixed value for the whole file —
+  // AgentRun.triggerRunId is unique; only one test here dispatches
+  // successfully today, but a fixed value is a landmine for the next
+  // test added that does too (checkpoint 2.4 hit exactly this in
+  // send.test.ts).
+  runAgentTurn: { trigger: vi.fn(() => Promise.resolve({ id: `run_mocked_${randomUUID()}` })) },
 }));
 
 import { runAgentTurn } from "@/trigger/run-agent-turn";

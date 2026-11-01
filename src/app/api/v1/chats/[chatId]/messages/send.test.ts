@@ -14,7 +14,11 @@ import { randomUUID } from "node:crypto";
 vi.mock("@clerk/backend", () => ({ verifyToken: vi.fn() }));
 vi.mock("@/lib/clerk", () => ({ clerkClient: { users: { getUser: vi.fn() } } }));
 vi.mock("@/trigger/run-agent-turn", () => ({
-  runAgentTurn: { trigger: vi.fn().mockResolvedValue({ id: `run_mocked_${randomUUID()}` }) },
+  // A fresh id per call, not one fixed value for the whole file —
+  // AgentRun.triggerRunId is unique, and more than one test here now
+  // dispatches successfully (checkpoint 2.4's duplicate-Idempotency-Key
+  // test is a second one), so a shared fixed id collides.
+  runAgentTurn: { trigger: vi.fn(() => Promise.resolve({ id: `run_mocked_${randomUUID()}` })) },
 }));
 
 import { verifyToken } from "@clerk/backend";
@@ -125,6 +129,45 @@ describe("POST /api/v1/chats/[chatId]/messages", () => {
       // QUEUED — this is purely a wiring check, not a behavioral one.
       expect(activeBody.data?.id).toBe(sendBody.data.runId);
       expect(activeBody.data?.status).toBe("QUEUED");
+    },
+  );
+
+  it(
+    "the same Idempotency-Key sent twice through the real route returns the same dispatch, not a " +
+      "second message or run — checkpoint 2.4's 'through the route, not just the DB layer' requirement",
+    async () => {
+      const clerkUserId = `${CLERK_ID_PREFIX}${randomUUID()}`;
+      const owner = await prisma.user.create({
+        data: { clerkUserId, email: `${clerkUserId}@example.com` },
+      });
+      const chat = await prisma.chat.create({ data: { userId: owner.id } });
+      const key = randomUUID();
+
+      const firstReq = await authedRequestAs(clerkUserId, `http://localhost/x`, {
+        method: "POST",
+        headers: { "Idempotency-Key": key },
+        body: JSON.stringify({ text: "once" }),
+      });
+      const firstRes = await POST(firstReq, routeCtx(chat.id));
+      expect(firstRes.status).toBe(202);
+      const firstBody = await firstRes.json();
+
+      const secondReq = await authedRequestAs(clerkUserId, `http://localhost/x`, {
+        method: "POST",
+        headers: { "Idempotency-Key": key },
+        body: JSON.stringify({ text: "once (retried)" }),
+      });
+      const secondRes = await POST(secondReq, routeCtx(chat.id));
+      expect(secondRes.status).toBe(202);
+      const secondBody = await secondRes.json();
+
+      expect(secondBody.data.runId).toBe(firstBody.data.runId);
+      expect(secondBody.data.messageId).toBe(firstBody.data.messageId);
+
+      const runCount = await prisma.agentRun.count({ where: { chatId: chat.id } });
+      expect(runCount).toBe(1);
+      const messageCount = await prisma.message.count({ where: { chatId: chat.id, role: "USER" } });
+      expect(messageCount).toBe(1);
     },
   );
 });

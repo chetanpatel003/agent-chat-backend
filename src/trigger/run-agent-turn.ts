@@ -1,6 +1,6 @@
 import { task } from "@trigger.dev/sdk";
 import { prisma } from "@/lib/prisma";
-import type { Prisma } from "@/generated/prisma/client";
+import { Prisma } from "@/generated/prisma/client";
 import type { ToolInvocationStatus, AgentRunStatus } from "@/generated/prisma/enums";
 import {
   callOpenRouter,
@@ -8,11 +8,25 @@ import {
   OpenRouterDefiniteError,
   type ProviderMessage,
   type ProviderToolCall,
+  type OpenRouterTurnResult,
 } from "@/providers/openrouter";
 import { buildConversationContext } from "@/providers/conversation-context";
 import { PRODUCTION_TOOL_REGISTRY, toOpenRouterTools } from "@/tools/registry";
 import type { ToolRegistry } from "@/tools/types";
 import type { ContentBlock } from "@/contracts/message";
+import {
+  ACTIVE_RUN_STATUSES,
+  casAgentRunStatus,
+  readAgentRunStatus,
+  SkippedTransition,
+  type GuardedTransitionResult,
+} from "@/services/run-transitions";
+import {
+  publishRunEvent,
+  createRunEventEmitter,
+  type PublishRunEvent,
+  type EmitRunEvent,
+} from "@/realtime/publish-run-event";
 
 export type RunAgentTurnPayload = {
   agentRunId: string;
@@ -24,54 +38,179 @@ const TERMINAL_STATUSES: AgentRunStatus[] = ["COMPLETED", "FAILED", "CANCELLED"]
 // can dispatch several tool calls at once. Generous enough for a real
 // multi-step tool chain, small enough to bound cost/latency decisively
 // rather than let a confused model loop indefinitely.
+//
+// Phase 3 prerequisite (not fixed in 2.4 — out of scope, documented so
+// it isn't lost): on the *last* allowed round, a tool_calls response is
+// still executed even though its result can never be sent back to the
+// model (the loop ends right after, via TURN_LIMIT_EXCEEDED) — real
+// external tool work (and credits) would be spent for nothing. Before
+// registering real Magica tools, stop dispatching new tool calls once
+// `turn === MAX_TURNS - 1` and go straight to the turn-limit failure
+// instead.
 const MAX_TURNS = 8;
 
 /**
- * The AgentRun fails safely, but the PENDING message (and any
- * ToolInvocation left RUNNING) is left untouched — it IS the durable
- * evidence of the unknown outcome, per project-docs/PHASE2-PLAN.md
- * §Decision C. Only the AgentRun transitions, which is what the rest of
- * the system reads to know this chat is no longer blocked. A human-
- * initiated retry sends a new message, which creates a genuinely new
- * AgentRun (send-turn.ts) — never a replay of this one.
+ * Every AgentRun status write below goes through the guarded CAS helper
+ * in run-transitions.ts, not a plain `update()` — a terminal state (in
+ * particular CANCELLED, written by the cancel route while this task may
+ * still be mid-call) can never be overwritten by a write that assumed
+ * the run was still active. A guard that affects zero rows means another
+ * process already decided this run's fate; this function backs off
+ * without writing or publishing anything further, returning the row's
+ * *real* current status rather than guessing who won the race.
  */
-async function markAmbiguous(agentRunId: string) {
-  await prisma.agentRun.update({
-    where: { id: agentRunId },
-    data: {
-      status: "FAILED",
-      errorCode: "AMBIGUOUS_PROVIDER_OUTCOME",
-      errorMessage:
-        "The AI provider's response was lost before we could record it (a timeout or interruption during the request) — we cannot tell whether it completed. Send a new message to try again; nothing was duplicated or charged twice.",
-      completedAt: new Date(),
-    },
+
+async function markAmbiguous(agentRunId: string): Promise<GuardedTransitionResult> {
+  return casAgentRunStatus(agentRunId, ACTIVE_RUN_STATUSES, {
+    status: "FAILED",
+    errorCode: "AMBIGUOUS_PROVIDER_OUTCOME",
+    errorMessage:
+      "The AI provider's response was lost before we could record it (a timeout or interruption during the request) — we cannot tell whether it completed. Send a new message to try again; nothing was duplicated or charged twice.",
+    completedAt: new Date(),
   });
 }
 
-/** A clean, known failure — safe to mark the message FAILED too, unlike
+async function ambiguousOutcome(agentRunId: string, emit: EmitRunEvent) {
+  const marked = await markAmbiguous(agentRunId);
+  if (!marked.applied) {
+    return { status: marked.currentStatus, skipped: true as const, ambiguous: false as const };
+  }
+  await emit({ type: "run_status", status: "FAILED", errorCode: "AMBIGUOUS_PROVIDER_OUTCOME" });
+  return { status: "FAILED" as const, skipped: false as const, ambiguous: true as const };
+}
+
+/**
+ * A clean, known failure — safe to mark the message FAILED too, unlike
  * the ambiguous case, because we genuinely know the attempt did not
- * produce a usable result. `content` (if given) preserves whatever
- * tool_use/tool_result blocks were already produced this turn — a
- * failure partway through a tool-calling loop shouldn't erase the part
- * that did happen. */
+ * produce a usable result. Both writes (Message, AgentRun) happen in one
+ * transaction, each itself guarded: if the message is no longer PENDING
+ * (another process — the cancel route — already finalized it), the
+ * whole transaction aborts and neither write lands, rather than the
+ * message staying terminal while AgentRun gets overwritten, or vice
+ * versa.
+ */
 async function markDefiniteFailure(
   agentRunId: string,
   pendingMessageId: string,
   errorCode: string,
   errorMessage: string,
   content?: ContentBlock[],
+): Promise<GuardedTransitionResult> {
+  try {
+    await prisma.$transaction(async (tx) => {
+      const message = await tx.message.updateMany({
+        where: { id: pendingMessageId, status: "PENDING" },
+        data: {
+          status: "FAILED",
+          ...(content ? { content: content as Prisma.InputJsonValue } : {}),
+        },
+      });
+      if (message.count === 0) throw new SkippedTransition();
+
+      const run = await tx.agentRun.updateMany({
+        where: { id: agentRunId, status: { in: ACTIVE_RUN_STATUSES } },
+        data: { status: "FAILED", errorCode, errorMessage, completedAt: new Date() },
+      });
+      if (run.count === 0) throw new SkippedTransition();
+    });
+    return { applied: true };
+  } catch (error) {
+    if (error instanceof SkippedTransition) {
+      return { applied: false, currentStatus: await readAgentRunStatus(agentRunId) };
+    }
+    throw error;
+  }
+}
+
+async function definiteFailureOutcome(
+  agentRunId: string,
+  pendingMessageId: string,
+  errorCode: string,
+  errorMessage: string,
+  content: ContentBlock[],
+  emit: EmitRunEvent,
 ) {
-  await prisma.message.update({
-    where: { id: pendingMessageId },
-    data: {
-      status: "FAILED",
-      ...(content ? { content: content as Prisma.InputJsonValue } : {}),
-    },
-  });
-  await prisma.agentRun.update({
-    where: { id: agentRunId },
-    data: { status: "FAILED", errorCode, errorMessage, completedAt: new Date() },
-  });
+  const marked = await markDefiniteFailure(agentRunId, pendingMessageId, errorCode, errorMessage, content);
+  if (!marked.applied) {
+    return { status: marked.currentStatus, skipped: true as const, ambiguous: false as const };
+  }
+  await emit({ type: "assistant_message", messageId: pendingMessageId, status: "FAILED" });
+  await emit({ type: "run_status", status: "FAILED", errorCode });
+  return { status: "FAILED" as const, skipped: false as const, ambiguous: false as const };
+}
+
+/** Same guarded-transaction shape as markDefiniteFailure, for the
+ * success path: Message -> COMPLETE, Chat.lastMessageAt, AgentRun ->
+ * COMPLETED, all-or-nothing, guarded by the message still being PENDING. */
+async function finalizeSuccess(
+  agentRunId: string,
+  pendingMessageId: string,
+  chatId: string,
+  content: ContentBlock[],
+  result: OpenRouterTurnResult,
+): Promise<GuardedTransitionResult> {
+  try {
+    await prisma.$transaction(async (tx) => {
+      const message = await tx.message.updateMany({
+        where: { id: pendingMessageId, status: "PENDING" },
+        data: { status: "COMPLETE", content: content as Prisma.InputJsonValue },
+      });
+      if (message.count === 0) throw new SkippedTransition();
+
+      await tx.chat.update({ where: { id: chatId }, data: { lastMessageAt: new Date() } });
+
+      const run = await tx.agentRun.updateMany({
+        where: { id: agentRunId, status: { in: ACTIVE_RUN_STATUSES } },
+        data: {
+          status: "COMPLETED",
+          model: result.model,
+          promptTokens: result.promptTokens,
+          completionTokens: result.completionTokens,
+          completedAt: new Date(),
+        },
+      });
+      if (run.count === 0) throw new SkippedTransition();
+    });
+    return { applied: true };
+  } catch (error) {
+    if (error instanceof SkippedTransition) {
+      return { applied: false, currentStatus: await readAgentRunStatus(agentRunId) };
+    }
+    throw error;
+  }
+}
+
+async function successOutcome(
+  agentRunId: string,
+  pendingMessageId: string,
+  chatId: string,
+  content: ContentBlock[],
+  result: OpenRouterTurnResult,
+  emit: EmitRunEvent,
+) {
+  const finalized = await finalizeSuccess(agentRunId, pendingMessageId, chatId, content, result);
+  if (!finalized.applied) {
+    return { status: finalized.currentStatus, skipped: true as const, ambiguous: false as const };
+  }
+  await emit({ type: "assistant_message", messageId: pendingMessageId, status: "COMPLETE" });
+  await emit({ type: "run_status", status: "COMPLETED" });
+  return { status: "COMPLETED" as const, skipped: false as const, ambiguous: false as const };
+}
+
+// Same empirically-verified P2002 shape as send-turn.ts's
+// ACTIVE_RUN_INDEX/IDEMPOTENCY_KEY_INDEX checks (decisions/0009): this
+// driver-adapter client's meta for a raw-SQL partial index isn't the
+// plain { target: string[] } shape standard guidance suggests.
+const ASSISTANT_MESSAGE_INDEX = "Message_one_assistant_per_run";
+
+function isDuplicateAssistantMessage(error: unknown): boolean {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") {
+    return false;
+  }
+  const meta = error.meta as
+    | { driverAdapterError?: { cause?: { constraint?: { index?: string } } } }
+    | undefined;
+  return meta?.driverAdapterError?.cause?.constraint?.index === ASSISTANT_MESSAGE_INDEX;
 }
 
 function toSafeInputRecord(value: unknown): Record<string, unknown> {
@@ -133,7 +272,8 @@ function buildToolCallOutcome(
  * both still produce a real, auditable ToolInvocation row (FAILED), so
  * every tool_use block in a message always has a real invocation behind
  * it, and the model always gets a tool_result it can react to instead of
- * the turn silently dying.
+ * the turn silently dying. Emits tool_started/tool_completed/tool_failed
+ * immediately after each corresponding persist — never before.
  */
 async function runOneToolCall(params: {
   toolCall: ProviderToolCall;
@@ -141,8 +281,9 @@ async function runOneToolCall(params: {
   agentRunId: string;
   userId: string;
   messageId: string;
+  emit: EmitRunEvent;
 }): Promise<ToolCallOutcome> {
-  const { toolCall, registry, agentRunId, userId, messageId } = params;
+  const { toolCall, registry, agentRunId, userId, messageId, emit } = params;
   const idempotencyKey = `${agentRunId}:${toolCall.id}`;
 
   let rawInput: unknown;
@@ -168,6 +309,12 @@ async function runOneToolCall(params: {
         errorMessage: `No tool named "${toolCall.function.name}" is registered.`,
       },
     });
+    await emit({
+      type: "tool_failed",
+      toolInvocationId: invocation.id,
+      toolName: toolCall.function.name,
+      errorCode: "UNKNOWN_TOOL",
+    });
     return buildToolCallOutcome(invocation, toolCall, rawInput, null, {
       code: "UNKNOWN_TOOL",
       message: invocation.errorMessage!,
@@ -186,6 +333,12 @@ async function runOneToolCall(params: {
         errorCode: "MALFORMED_ARGUMENTS",
         errorMessage: `Tool call arguments were not valid JSON: ${malformedArguments}`,
       },
+    });
+    await emit({
+      type: "tool_failed",
+      toolInvocationId: invocation.id,
+      toolName: tool.name,
+      errorCode: "MALFORMED_ARGUMENTS",
     });
     return buildToolCallOutcome(invocation, toolCall, rawInput, null, {
       code: "MALFORMED_ARGUMENTS",
@@ -207,6 +360,12 @@ async function runOneToolCall(params: {
         errorMessage: `Invalid input: ${parsedInput.error.message}`,
       },
     });
+    await emit({
+      type: "tool_failed",
+      toolInvocationId: invocation.id,
+      toolName: tool.name,
+      errorCode: "INVALID_INPUT",
+    });
     return buildToolCallOutcome(invocation, toolCall, rawInput, null, {
       code: "INVALID_INPUT",
       message: invocation.errorMessage!,
@@ -227,6 +386,7 @@ async function runOneToolCall(params: {
       status: "RUNNING",
     },
   });
+  await emit({ type: "tool_started", toolInvocationId: invocation.id, toolName: tool.name });
 
   const startedAt = Date.now();
   try {
@@ -238,6 +398,13 @@ async function runOneToolCall(params: {
       const failed = await prisma.toolInvocation.update({
         where: { id: invocation.id },
         data: { status: "FAILED", errorCode: "INVALID_OUTPUT", errorMessage, durationMs },
+      });
+      await emit({
+        type: "tool_failed",
+        toolInvocationId: failed.id,
+        toolName: tool.name,
+        durationMs,
+        errorCode: "INVALID_OUTPUT",
       });
       return buildToolCallOutcome(failed, toolCall, rawInput, null, {
         code: "INVALID_OUTPUT",
@@ -252,6 +419,7 @@ async function runOneToolCall(params: {
         durationMs,
       },
     });
+    await emit({ type: "tool_completed", toolInvocationId: completed.id, toolName: tool.name, durationMs });
     return buildToolCallOutcome(
       completed,
       toolCall,
@@ -265,6 +433,13 @@ async function runOneToolCall(params: {
     const failed = await prisma.toolInvocation.update({
       where: { id: invocation.id },
       data: { status: "FAILED", errorCode: "EXECUTION_FAILED", errorMessage, durationMs },
+    });
+    await emit({
+      type: "tool_failed",
+      toolInvocationId: failed.id,
+      toolName: tool.name,
+      durationMs,
+      errorCode: "EXECUTION_FAILED",
     });
     return buildToolCallOutcome(failed, toolCall, rawInput, null, {
       code: "EXECUTION_FAILED",
@@ -280,22 +455,29 @@ async function runOneToolCall(params: {
  * every behavioral test. `pnpm trigger:dev` is still how this actually
  * runs in dev/prod; see run-agent-turn.test.ts for why both matter.
  *
- * `registry` defaults to the empty production registry (Decision A) —
- * tests substitute their own via this parameter rather than module-
- * mocking (found fragile in checkpoint 2.2 — see decisions/0010) or
- * mutating shared module state (risky for cross-file test isolation).
+ * `registry` and `publish` both default to the production
+ * implementations (the empty registry per Decision A; the real
+ * Trigger.dev-metadata publisher) and are dependency-injected rather
+ * than module-mocked — the same pattern established in checkpoint 2.3
+ * for the registry, now extended to the publisher for the same reason:
+ * module-mocking Trigger.dev's own SDK was found fragile in checkpoint
+ * 2.2 (a `vi.spyOn` on the task silently failed to intercept a real
+ * call).
  */
 export async function executeAgentTurn(
   payload: RunAgentTurnPayload,
   registry: ToolRegistry = PRODUCTION_TOOL_REGISTRY,
+  publish: PublishRunEvent = publishRunEvent,
 ) {
   const run = await prisma.agentRun.findUniqueOrThrow({
     where: { id: payload.agentRunId },
   });
+  const emit = createRunEventEmitter(run.id, publish);
 
   // Terminal states are never reopened — this check runs before
   // anything else, so a late-arriving duplicate invocation (a Trigger.dev
-  // retry racing a completed attempt, or its own idempotencyKey not
+  // retry racing a completed attempt, a cancellation that landed while
+  // this exact attempt was in flight, or its own idempotencyKey not
   // being assumed infallible) can never overwrite a terminal AgentRun.
   if (TERMINAL_STATUSES.includes(run.status)) {
     return { status: run.status, skipped: true as const, ambiguous: false as const };
@@ -323,8 +505,7 @@ export async function executeAgentTurn(
         })
         .catch(() => null);
     }
-    await markAmbiguous(run.id);
-    return { status: "FAILED" as const, skipped: false as const, ambiguous: true as const };
+    return ambiguousOutcome(run.id, emit);
   }
 
   // Re-entry ambiguous-outcome detection. A PENDING assistant message
@@ -338,14 +519,22 @@ export async function executeAgentTurn(
     where: { agentRunId: run.id, role: "ASSISTANT", status: "PENDING" },
   });
   if (stalePending) {
-    await markAmbiguous(run.id);
-    return { status: "FAILED" as const, skipped: false as const, ambiguous: true as const };
+    return ambiguousOutcome(run.id, emit);
   }
 
-  await prisma.agentRun.update({
-    where: { id: run.id },
-    data: { status: "RUNNING", startedAt: run.startedAt ?? new Date() },
+  // Guarded: a cancellation could have landed between the terminal check
+  // above and here. QUEUED is the normal fresh-start case; RUNNING is
+  // allowed too for the narrow re-entry window where a previous attempt
+  // marked RUNNING but crashed before inserting any PENDING message —
+  // safe to just continue, not a reason to restart the whole run.
+  const toRunning = await casAgentRunStatus(run.id, ["QUEUED", "RUNNING"], {
+    status: "RUNNING",
+    startedAt: run.startedAt ?? new Date(),
   });
+  if (!toRunning.applied) {
+    return { status: toRunning.currentStatus, skipped: true as const, ambiguous: false as const };
+  }
+  await emit({ type: "run_status", status: "RUNNING" });
 
   const history = await buildConversationContext(run.chatId);
 
@@ -355,16 +544,33 @@ export async function executeAgentTurn(
   // per model-call round) — matching the product's one-bubble-per-turn
   // rendering, and matching Decision C's ambiguity granularity: any
   // crash anywhere in the loop leaves this same row at PENDING.
-  const pendingMessage = await prisma.message.create({
-    data: {
-      chatId: run.chatId,
-      userId: run.userId,
-      agentRunId: run.id,
-      role: "ASSISTANT",
-      status: "PENDING",
-      content: [],
-    },
-  });
+  //
+  // The partial unique index Message_one_assistant_per_run is the real
+  // mutex against two truly concurrent executeAgentTurn() calls for the
+  // same run: both can pass every read-check above (neither has
+  // inserted anything yet), but only one of these inserts can succeed.
+  // The loser's P2002 here is "a duplicate concurrent execution," not an
+  // error — it exits without touching AgentRun state, same as any other
+  // guard loss, because the winner owns this run now.
+  let pendingMessage;
+  try {
+    pendingMessage = await prisma.message.create({
+      data: {
+        chatId: run.chatId,
+        userId: run.userId,
+        agentRunId: run.id,
+        role: "ASSISTANT",
+        status: "PENDING",
+        content: [],
+      },
+    });
+  } catch (error) {
+    if (isDuplicateAssistantMessage(error)) {
+      const current = await readAgentRunStatus(run.id);
+      return { status: current, skipped: true as const, ambiguous: false as const };
+    }
+    throw error;
+  }
 
   const providerTools = toOpenRouterTools(registry);
   const content: ContentBlock[] = [];
@@ -375,6 +581,14 @@ export async function executeAgentTurn(
   const turnMessages: ProviderMessage[] = [];
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
+    // Checked between loop iterations: a cancel arriving while idle
+    // between rounds is caught here, before wasting another provider
+    // call that would just be discarded anyway.
+    const beforeRound = await readAgentRunStatus(run.id);
+    if (beforeRound !== "RUNNING") {
+      return { status: beforeRound, skipped: true as const, ambiguous: false as const };
+    }
+
     await prisma.agentRun.update({ where: { id: run.id }, data: { turnCount: turn + 1 } });
 
     let result;
@@ -382,18 +596,25 @@ export async function executeAgentTurn(
       result = await callOpenRouter([...history, ...turnMessages], providerTools);
     } catch (error) {
       if (error instanceof OpenRouterAmbiguousError) {
-        await markAmbiguous(run.id);
-        return { status: "FAILED" as const, skipped: false as const, ambiguous: true as const };
+        return ambiguousOutcome(run.id, emit);
       }
       if (error instanceof OpenRouterDefiniteError) {
-        await markDefiniteFailure(run.id, pendingMessage.id, error.code, error.message, content);
-        return { status: "FAILED" as const, skipped: false as const, ambiguous: false as const };
+        return definiteFailureOutcome(run.id, pendingMessage.id, error.code, error.message, content, emit);
       }
       // Genuinely unexpected (e.g. a DB write failure) — rethrow and let
       // Trigger.dev's own retry policy handle it. The next attempt's
       // re-entry check above will find this same PENDING row and treat
       // it as ambiguous rather than calling OpenRouter again.
       throw error;
+    }
+
+    // Checked immediately after the provider call returns — the
+    // critical window: a cancel could have landed in the database while
+    // this call was in flight. Caught here, before any write assumes
+    // the run is still ours to finalize.
+    const afterCall = await readAgentRunStatus(run.id);
+    if (afterCall !== "RUNNING") {
+      return { status: afterCall, skipped: true as const, ambiguous: false as const };
     }
 
     // Pushed unconditionally, before branching on tool_calls: any
@@ -403,28 +624,7 @@ export async function executeAgentTurn(
     if (result.text) content.push({ type: "text", text: result.text });
 
     if (!result.toolCalls) {
-      await prisma.message.update({
-        where: { id: pendingMessage.id },
-        // Prisma's Json input type doesn't structurally accept our own
-        // ContentBlock union — isolated cast at this one boundary;
-        // `content` itself stays fully typed everywhere else here.
-        data: { status: "COMPLETE", content: content as Prisma.InputJsonValue },
-      });
-      await prisma.chat.update({
-        where: { id: run.chatId },
-        data: { lastMessageAt: new Date() },
-      });
-      await prisma.agentRun.update({
-        where: { id: run.id },
-        data: {
-          status: "COMPLETED",
-          model: result.model,
-          promptTokens: result.promptTokens,
-          completionTokens: result.completionTokens,
-          completedAt: new Date(),
-        },
-      });
-      return { status: "COMPLETED" as const, skipped: false as const, ambiguous: false as const };
+      return successOutcome(run.id, pendingMessage.id, run.chatId, content, result, emit);
     }
 
     // The model asked for one or more tools. Its own tool-calling
@@ -439,36 +639,45 @@ export async function executeAgentTurn(
     // inserts and the shared `content` array; not worth it before a real
     // tool has latency that makes it matter).
     for (const toolCall of result.toolCalls) {
+      // Checked immediately before each tool execution.
+      const beforeTool = await readAgentRunStatus(run.id);
+      if (beforeTool !== "RUNNING") {
+        return { status: beforeTool, skipped: true as const, ambiguous: false as const };
+      }
+
       const outcome = await runOneToolCall({
         toolCall,
         registry,
         agentRunId: run.id,
         userId: run.userId,
         messageId: pendingMessage.id,
+        emit,
       });
       content.push(...outcome.blocks);
       turnMessages.push(outcome.providerMessage);
-    }
 
-    // Persist progress made this round even though the Message is still
-    // PENDING — partial content survives a crash on the *next* model
-    // call instead of being silently lost.
-    await prisma.message.update({
-      where: { id: pendingMessage.id },
-      data: { content: content as Prisma.InputJsonValue },
-    });
+      // Persisted after *each* tool call, not batched once per round —
+      // so a cancellation detected partway through a multi-tool-call
+      // round never loses an earlier call's already-finished result.
+      // Content-only; never touches status, so it's safe even if a
+      // cancel is racing it (disjoint columns, no guard needed here).
+      await prisma.message.update({
+        where: { id: pendingMessage.id },
+        data: { content: content as Prisma.InputJsonValue },
+      });
+    }
   }
 
   // Bounded loop exhausted without a final answer. A known, definite
   // outcome (we chose to stop) — not ambiguous.
-  await markDefiniteFailure(
+  return definiteFailureOutcome(
     run.id,
     pendingMessage.id,
     "TURN_LIMIT_EXCEEDED",
     "The agent did not produce a final answer within the maximum number of turns.",
     content,
+    emit,
   );
-  return { status: "FAILED" as const, skipped: false as const, ambiguous: false as const };
 }
 
 export const runAgentTurn = task({
@@ -476,7 +685,8 @@ export const runAgentTurn = task({
   // Wrapped, not passed directly: Trigger.dev calls `run(payload, ctx)`
   // with its own second argument, which would otherwise land in
   // executeAgentTurn's `registry` parameter and silently break the
-  // default. Production always gets the one-argument call, so the
-  // default (the empty PRODUCTION_TOOL_REGISTRY) applies.
+  // default. Production always gets the one-argument call, so both
+  // defaults (the empty PRODUCTION_TOOL_REGISTRY, the real publisher)
+  // apply.
   run: (payload: RunAgentTurnPayload) => executeAgentTurn(payload),
 });

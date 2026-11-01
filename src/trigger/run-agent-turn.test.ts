@@ -11,10 +11,21 @@ import { prisma } from "@/lib/prisma";
 import { makeTestUser, cleanupTestUsers } from "@/test-utils/db-fixtures";
 import { createToolRegistry } from "@/tools/registry";
 import { fixtureTool, fixtureToolWithReconcile, FIXTURE_TOOL_NAME } from "@/test-utils/fixture-tool";
+import type { PublishRunEvent } from "@/realtime/publish-run-event";
+import { cancelRun } from "@/services/agent-run";
 import { executeAgentTurn } from "./run-agent-turn";
 
 const mockCallOpenRouter = vi.mocked(callOpenRouter);
 const createdUserIds: string[] = [];
+
+// Checkpoint 2.4: every call site below injects an explicit publisher
+// rather than relying on the real default — the real one calls
+// Trigger.dev's `metadata.append`, which throws "Method not
+// implemented" outside a live task context (confirmed empirically,
+// caught safely by publishRunEvent's own try/catch, but noisy and
+// beside the point for tests that aren't exercising the publisher
+// itself). Tests that *do* care about publishing inject their own spy.
+const noopPublish: PublishRunEvent = vi.fn().mockResolvedValue(undefined);
 
 function toolCall(name: string, args: Record<string, unknown> | string, id = randomUUID()): ProviderToolCall {
   return {
@@ -72,7 +83,7 @@ describe("executeAgentTurn — success", () => {
       completionTokens: 49,
     });
 
-    const result = await executeAgentTurn({ agentRunId: run.id });
+    const result = await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
     expect(result.status).toBe("COMPLETED");
 
     const updatedRun = await prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } });
@@ -110,7 +121,7 @@ describe("executeAgentTurn — success", () => {
       completionTokens: 1,
     });
 
-    await executeAgentTurn({ agentRunId: run.id });
+    await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
 
     const [context] = mockCallOpenRouter.mock.calls[0];
     expect(context).toEqual([{ role: "user", content: "hello" }]);
@@ -126,7 +137,7 @@ describe("executeAgentTurn — definite failure", () => {
       new OpenRouterDefiniteError("Rate limit exceeded", "RATE_LIMITED"),
     );
 
-    const result = await executeAgentTurn({ agentRunId: run.id });
+    const result = await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
     expect(result.status).toBe("FAILED");
     expect(result.ambiguous).toBe(false);
 
@@ -148,7 +159,7 @@ describe("executeAgentTurn — ambiguous outcome and crash recovery", () => {
     const { OpenRouterAmbiguousError } = await import("@/providers/openrouter");
     mockCallOpenRouter.mockRejectedValueOnce(new OpenRouterAmbiguousError("timed out"));
 
-    const result = await executeAgentTurn({ agentRunId: run.id });
+    const result = await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
     expect(result.ambiguous).toBe(true);
 
     const updatedRun = await prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } });
@@ -189,7 +200,7 @@ describe("executeAgentTurn — ambiguous outcome and crash recovery", () => {
       });
 
       // Act: re-enter, exactly as a Trigger.dev retry or manual resume would.
-      const result = await executeAgentTurn({ agentRunId: run.id });
+      const result = await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
 
       // The one guarantee that actually matters: no second request.
       expect(mockCallOpenRouter).not.toHaveBeenCalled();
@@ -228,8 +239,8 @@ describe("executeAgentTurn — terminal re-entry / duplicate dispatch", () => {
       completionTokens: 1,
     });
 
-    await executeAgentTurn({ agentRunId: run.id });
-    const second = await executeAgentTurn({ agentRunId: run.id });
+    await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
+    const second = await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
 
     expect(second.skipped).toBe(true);
     expect(mockCallOpenRouter).toHaveBeenCalledTimes(1);
@@ -258,7 +269,7 @@ describe("executeAgentTurn — tool calling", () => {
     mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
     mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
 
-    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
     expect(result.status).toBe("COMPLETED");
     expect(mockCallOpenRouter).toHaveBeenCalledTimes(2);
     expect(executeSpy).toHaveBeenCalledTimes(1);
@@ -304,7 +315,7 @@ describe("executeAgentTurn — tool calling", () => {
     mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call], "Let me check that for you."));
     mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
 
-    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
 
     const assistantMsg = await prisma.message.findFirstOrThrow({
       where: { agentRunId: run.id, role: "ASSISTANT" },
@@ -322,7 +333,7 @@ describe("executeAgentTurn — tool calling", () => {
     mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
     mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("sorry, bad input"));
 
-    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
     expect(result.status).toBe("COMPLETED");
     expect(executeSpy).not.toHaveBeenCalled();
 
@@ -343,7 +354,7 @@ describe("executeAgentTurn — tool calling", () => {
     mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
     mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("ok"));
 
-    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
     expect(result.status).toBe("COMPLETED");
     expect(executeSpy).not.toHaveBeenCalled();
 
@@ -362,7 +373,7 @@ describe("executeAgentTurn — tool calling", () => {
     mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
     mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("ok"));
 
-    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
     expect(result.status).toBe("COMPLETED");
 
     const invocation = await prisma.toolInvocation.findFirstOrThrow({
@@ -381,7 +392,7 @@ describe("executeAgentTurn — tool calling", () => {
     mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
     mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("ok"));
 
-    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
     expect(result.status).toBe("COMPLETED");
 
     const invocation = await prisma.toolInvocation.findFirstOrThrow({
@@ -402,8 +413,8 @@ describe("executeAgentTurn — tool calling", () => {
     mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
     mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
 
-    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
-    const second = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
+    const second = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
 
     expect(second.skipped).toBe(true);
     expect(executeSpy).toHaveBeenCalledTimes(1);
@@ -468,7 +479,7 @@ describe("executeAgentTurn — tool re-entry and reconcile()", () => {
     });
 
     const { tool, executeSpy } = spiedTool();
-    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
 
     expect(executeSpy).not.toHaveBeenCalled();
     expect(mockCallOpenRouter).not.toHaveBeenCalled();
@@ -516,7 +527,7 @@ describe("executeAgentTurn — tool re-entry and reconcile()", () => {
     const executeSpy = vi.fn(fixtureToolWithReconcile.execute);
     const tool = { ...fixtureToolWithReconcile, reconcile: reconcileSpy, execute: executeSpy };
 
-    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
 
     expect(reconcileSpy).toHaveBeenCalledTimes(1);
     expect(reconcileSpy).toHaveBeenCalledWith({
@@ -537,6 +548,9 @@ describe("executeAgentTurn — tool re-entry and reconcile()", () => {
 
 describe("executeAgentTurn — turn limit", () => {
   it("stops after the maximum number of turns if the model never produces a final answer, preserving partial content", async () => {
+    // Checkpoint 2.4 added guarded status reads before/after each round
+    // and before each tool call — real round trips to Neon, not free —
+    // so 8 full rounds genuinely needs more than the global 20s budget.
     const owner = await user("tool-turn-limit");
     const { run } = await setUpRun(owner);
     const { tool } = spiedTool();
@@ -545,7 +559,7 @@ describe("executeAgentTurn — turn limit", () => {
       toolRequest([toolCall(FIXTURE_TOOL_NAME, { timezone: "UTC" })]),
     );
 
-    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]));
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
     expect(result.status).toBe("FAILED");
     expect(result.ambiguous).toBe(false);
 
@@ -561,5 +575,287 @@ describe("executeAgentTurn — turn limit", () => {
     const blocks = assistantMsg.content as Array<Record<string, unknown>>;
     expect(blocks.length).toBe(16); // 8 rounds * (tool_use + tool_result), no final text block
     expect(blocks.every((b) => b.type === "tool_use" || b.type === "tool_result")).toBe(true);
+  }, 40000);
+});
+
+// Checkpoint 2.4 — guarded CAS transitions, atomic terminal writes, the
+// one-assistant-message-per-run index as a real concurrency mutex,
+// cancellation, and realtime publishing. See
+// project-docs/API_CONTRACTS.md for the full mechanism.
+
+describe("executeAgentTurn — concurrent duplicate execution", () => {
+  it(
+    "two concurrent executions for the same run produce exactly one assistant message, exactly one " +
+      "provider call, and a single consistent terminal outcome both executions agree on",
+    async () => {
+      const owner = await user("concurrent-dup");
+      const { run } = await setUpRun(owner);
+
+      // A real delay forces genuine overlap between the two executions —
+      // without it, nothing guarantees they actually race rather than one
+      // completing before the other starts.
+      mockCallOpenRouter.mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve(finalAnswer("done")), 30)),
+      );
+
+      const [resultA, resultB] = await Promise.all([
+        executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish),
+        executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish),
+      ]);
+
+      // The real mutex is the partial unique index on Message(agentRunId)
+      // WHERE role='ASSISTANT' — both executions can pass every read-check
+      // above (neither has inserted anything yet), but only one insert can
+      // ever succeed; the loser's P2002 exits it immediately, before it
+      // ever reaches the provider call.
+      expect(mockCallOpenRouter).toHaveBeenCalledTimes(1);
+
+      const assistantCount = await prisma.message.count({
+        where: { agentRunId: run.id, role: "ASSISTANT" },
+      });
+      expect(assistantCount).toBe(1);
+
+      // Which of the two outcomes wins is a genuine, narrow race, not
+      // something this test pins down: the "loser" can discover the
+      // "winner's" still-PENDING message via the stale-message re-entry
+      // check *before* the winner's own provider call resolves, and
+      // mark the run FAILED/AMBIGUOUS_PROVIDER_OUTCOME — pre-empting an
+      // otherwise-successful completion (the winner's own guarded
+      // finalize transaction then correctly finds the run no longer
+      // active and backs off, never corrupting anything). Either
+      // outcome is safe: exactly one message, exactly one provider
+      // call, exactly one terminal state. See API_CONTRACTS.md for why
+      // this is an accepted trade-off rather than a bug fixed here —
+      // Trigger.dev's own idempotencyKey + liveness-based retries mean
+      // genuinely concurrent execution of the same AgentRun essentially
+      // doesn't happen in production; this test is a more aggressive,
+      // synthetic race than production ever produces.
+      const updatedRun = await prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } });
+      expect(["COMPLETED", "FAILED"]).toContain(updatedRun.status);
+
+      // Both executions must agree with the final state — never torn,
+      // never reporting something the database doesn't reflect.
+      expect(resultA.status).toBe(updatedRun.status);
+      expect(resultB.status).toBe(updatedRun.status);
+
+      // Exactly one execution actually did the work (completed the run
+      // or marked it ambiguous); the other cleanly deferred.
+      const skippedCount = [resultA, resultB].filter((r) => r.skipped).length;
+      expect(skippedCount).toBe(1);
+    },
+  );
+});
+
+describe("executeAgentTurn — cancellation", () => {
+  it("cancelling a QUEUED run causes the worker to skip without calling OpenRouter", async () => {
+    const owner = await user("cancel-while-queued");
+    const { chat, run } = await setUpRun(owner);
+
+    const cancelled = await cancelRun(owner.id, chat.id, run.id);
+    expect(cancelled.status).toBe("CANCELLED");
+
+    const result = await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
+    expect(result.skipped).toBe(true);
+    expect(result.status).toBe("CANCELLED");
+    expect(mockCallOpenRouter).not.toHaveBeenCalled();
   });
+
+  it(
+    "cancelling while the provider call is active ends in CANCELLED (not a completion or an " +
+      "ambiguous failure), preserves content from an earlier completed round, and never executes " +
+      "the tool the delayed response would otherwise have requested",
+    async () => {
+      const owner = await user("cancel-mid-call");
+      const { chat, run } = await setUpRun(owner);
+      const { tool, executeSpy } = spiedTool();
+
+      let callCount = 0;
+      let releaseSecondCall: ((value: ReturnType<typeof toolRequest>) => void) | undefined;
+      mockCallOpenRouter.mockImplementation(() => {
+        callCount += 1;
+        if (callCount === 1) {
+          // Round 1 completes normally, producing real, persisted content.
+          return Promise.resolve(toolRequest([toolCall(FIXTURE_TOOL_NAME, { timezone: "UTC" })]));
+        }
+        // Round 2 is held open until the test explicitly releases it —
+        // this is the call the cancellation needs to land "during."
+        return new Promise<ReturnType<typeof toolRequest>>((resolve) => {
+          releaseSecondCall = resolve;
+        });
+      });
+
+      const execution = executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), noopPublish);
+
+      // Manual poll, not vi.waitFor: checkpoint 2.4 added several
+      // guarded status reads per round, each a real round trip to
+      // Neon, so reaching round 2's provider call takes a few seconds.
+      for (let i = 0; i < 200 && callCount < 2; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(callCount).toBe(2);
+      executeSpy.mockClear(); // only care about calls *after* this point
+
+      const cancelled = await cancelRun(owner.id, chat.id, run.id);
+      expect(cancelled.status).toBe("CANCELLED");
+
+      // Released only now — a second tool call this response would
+      // otherwise trigger must never actually run.
+      releaseSecondCall?.(toolRequest([toolCall(FIXTURE_TOOL_NAME, { timezone: "UTC" })]));
+      const result = await execution;
+
+      expect(result.skipped).toBe(true);
+      expect(result.status).toBe("CANCELLED");
+      expect(executeSpy).not.toHaveBeenCalled();
+
+      const updatedRun = await prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } });
+      expect(updatedRun.status).toBe("CANCELLED");
+      expect(updatedRun.errorCode).toBe("CANCELLED_BY_USER");
+
+      const assistantMsg = await prisma.message.findFirstOrThrow({
+        where: { agentRunId: run.id, role: "ASSISTANT" },
+      });
+      expect(assistantMsg.status).toBe("CANCELLED");
+      const blocks = assistantMsg.content as Array<Record<string, unknown>>;
+      // Round 1's tool_use + tool_result — preserved exactly, not erased
+      // or overwritten by the cancellation.
+      expect(blocks.length).toBe(2);
+      expect(blocks[0].type).toBe("tool_use");
+      expect(blocks[1].type).toBe("tool_result");
+
+      // Only round 1's invocation exists — round 2 never started.
+      const invocationCount = await prisma.toolInvocation.count({ where: { agentRunId: run.id } });
+      expect(invocationCount).toBe(1);
+    },
+    60000,
+  );
+
+  it("cancelling an already-terminal (COMPLETED) run returns it unchanged — no second cancellation write", async () => {
+    const owner = await user("cancel-already-completed");
+    const { chat, run } = await setUpRun(owner);
+    await prisma.agentRun.update({
+      where: { id: run.id },
+      data: { status: "COMPLETED", completedAt: new Date() },
+    });
+
+    const result = await cancelRun(owner.id, chat.id, run.id);
+    expect(result.status).toBe("COMPLETED");
+    expect(result.errorCode).toBeNull();
+  });
+});
+
+describe("executeAgentTurn — realtime publishing (publish-after-commit)", () => {
+  it("publishes run_status/assistant_message only after the corresponding database write has committed", async () => {
+    const owner = await user("publish-after-commit");
+    const { run } = await setUpRun(owner);
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+
+    const seen: Array<{ type: string; agentRunStatus: string; messageStatus: string | null }> = [];
+    const publish: PublishRunEvent = vi.fn(async (event) => {
+      const [agentRun, message] = await Promise.all([
+        prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } }),
+        prisma.message.findFirst({ where: { agentRunId: run.id, role: "ASSISTANT" } }),
+      ]);
+      seen.push({
+        type: event.type,
+        agentRunStatus: agentRun.status,
+        messageStatus: message?.status ?? null,
+      });
+    });
+
+    await executeAgentTurn({ agentRunId: run.id }, undefined, publish);
+
+    expect(seen.map((s) => s.type)).toEqual(["run_status", "assistant_message", "run_status"]);
+    expect(seen[0].agentRunStatus).toBe("RUNNING");
+    expect(seen[1].agentRunStatus).toBe("COMPLETED");
+    expect(seen[1].messageStatus).toBe("COMPLETE");
+    expect(seen[2].agentRunStatus).toBe("COMPLETED");
+  });
+
+  it("publishes tool_started/tool_completed only after the corresponding ToolInvocation write has committed", async () => {
+    const owner = await user("publish-tool-after-commit");
+    const { run } = await setUpRun(owner);
+    const { tool } = spiedTool();
+    const call = toolCall(FIXTURE_TOOL_NAME, { timezone: "UTC" });
+
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([call]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+
+    const seenToolStatus: Record<string, string> = {};
+    const publish: PublishRunEvent = vi.fn(async (event) => {
+      if (event.type === "tool_started" || event.type === "tool_completed") {
+        const invocation = await prisma.toolInvocation.findUniqueOrThrow({
+          where: { id: event.toolInvocationId },
+        });
+        seenToolStatus[event.type] = invocation.status;
+      }
+    });
+
+    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool]), publish);
+
+    expect(seenToolStatus.tool_started).toBe("RUNNING");
+    expect(seenToolStatus.tool_completed).toBe("COMPLETED");
+  });
+});
+
+describe("executeAgentTurn — realtime publisher failure isolation", () => {
+  it("a publisher that throws synchronously on every call never interrupts the run", async () => {
+    const owner = await user("publisher-always-throws");
+    const { run } = await setUpRun(owner);
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+
+    const throwingPublish: PublishRunEvent = vi.fn(() => {
+      throw new Error("publisher is broken");
+    });
+
+    const result = await executeAgentTurn({ agentRunId: run.id }, undefined, throwingPublish);
+    expect(result.status).toBe("COMPLETED");
+
+    const updatedRun = await prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } });
+    expect(updatedRun.status).toBe("COMPLETED");
+    const assistantMsg = await prisma.message.findFirstOrThrow({
+      where: { agentRunId: run.id, role: "ASSISTANT" },
+    });
+    expect(assistantMsg.status).toBe("COMPLETE");
+    expect(throwingPublish).toHaveBeenCalled();
+  });
+
+  it("a publisher that rejects asynchronously on every call is isolated the same way", async () => {
+    const owner = await user("publisher-rejects-async");
+    const { run } = await setUpRun(owner);
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+
+    const rejectingPublish: PublishRunEvent = vi.fn().mockRejectedValue(new Error("network blip"));
+
+    const result = await executeAgentTurn({ agentRunId: run.id }, undefined, rejectingPublish);
+    expect(result.status).toBe("COMPLETED");
+  });
+});
+
+describe("executeAgentTurn — terminal-state protection", () => {
+  it.each(["COMPLETED", "FAILED", "CANCELLED"] as const)(
+    "a run already %s accepts no further writes, publishes nothing, and never calls OpenRouter",
+    async (status) => {
+      const owner = await user(`terminal-${status.toLowerCase()}`);
+      const { run } = await setUpRun(owner);
+      await prisma.agentRun.update({
+        where: { id: run.id },
+        data: { status, completedAt: new Date() },
+      });
+      const before = await prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } });
+
+      const publish: PublishRunEvent = vi.fn();
+      const result = await executeAgentTurn({ agentRunId: run.id }, undefined, publish);
+
+      expect(result).toEqual({ status, skipped: true, ambiguous: false });
+      expect(mockCallOpenRouter).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+
+      const after = await prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } });
+      expect(after.updatedAt).toEqual(before.updatedAt);
+      const assistantCount = await prisma.message.count({
+        where: { agentRunId: run.id, role: "ASSISTANT" },
+      });
+      expect(assistantCount).toBe(0);
+    },
+  );
 });

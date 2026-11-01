@@ -49,6 +49,45 @@ orchestration-level re-entry check (`run-agent-turn.test.ts` proves the
 constraint itself rejects a duplicate insert, not just that the
 application-level logic avoids attempting one).
 
+## Checkpoint 2.4 — migration `20261101121924_one_assistant_message_per_run`
+Applied and verified: `prisma migrate status` → "Database schema is up
+to date." Exact resulting DDL, confirmed by querying `pg_indexes`
+directly (not assumed from the migration file):
+
+```sql
+CREATE UNIQUE INDEX "Message_one_assistant_per_run" ON public."Message" USING btree ("agentRunId") WHERE (role = 'ASSISTANT'::"MessageRole")
+```
+
+Same situation as `AgentRun_one_active_per_chat` in the 20261101000001
+migration — a partial unique index has no Prisma schema-language
+attribute, so this is hand-added SQL in an otherwise-empty migration
+(scaffolded via `prisma migrate dev --create-only`, then edited before
+`prisma migrate deploy`), not a `schema.prisma` change.
+
+**Why:** checkpoint 2.3's design already relied on exactly one
+accumulating-content-blocks ASSISTANT message per AgentRun; this index
+makes that invariant database-enforced, and — more importantly — gives
+two genuinely concurrent `executeAgentTurn()` invocations for the same
+run a real mutex. Both can pass every re-entry read-check (neither has
+inserted anything yet), but only one message insert can succeed; the
+loser's `P2002` is caught in `run-agent-turn.ts` and treated as "a
+duplicate concurrent execution," exiting without touching `AgentRun`
+state. Verified for real in `run-agent-turn.test.ts`'s concurrency test
+(`Promise.all` of two `executeAgentTurn()` calls for the same run, a
+delayed mocked provider response to force overlap): exactly one
+assistant message, exactly one provider call.
+
+**Rollback:** `DROP INDEX "Message_one_assistant_per_run";` — no data
+depends on the index beyond the constraint itself; nothing else
+references it by name.
+
+**Multi-assistant-message audit (required before adding this index):**
+grepped every `message.create`/`messages.create` call site outside
+tests and outside Prisma's own generated client — exactly one exists
+(`run-agent-turn.ts`'s `pendingMessage` insert); `send-turn.ts` only
+ever creates the USER message. No intentional multiple-assistant-
+message-per-run workflow exists anywhere in the codebase.
+
 ## Prisma CLI / Neon connectivity
 `prisma migrate dev`/`deploy` initially failed (`P1001`) against a cold Neon compute; migration was generated via `migrate diff --from-empty --to-schema` (no DB connection) and applied directly via `pg`, recorded into `_prisma_migrations` to match what `deploy` would have produced. Once compute was warm, `prisma migrate status` succeeded normally and confirmed the same state. Full writeup: decisions/0006.
 

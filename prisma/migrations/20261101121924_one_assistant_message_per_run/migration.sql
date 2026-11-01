@@ -1,0 +1,17 @@
+-- Checkpoint 2.4: one ASSISTANT message per AgentRun.
+--
+-- Not expressible as a Prisma schema attribute (no partial-index support
+-- in the Prisma schema language, same situation as
+-- AgentRun_one_active_per_chat in the 20261101000001 migration) — hand-
+-- added here. See project-docs/DATABASE.md and the checkpoint 2.4 report.
+--
+-- Design: run-agent-turn.ts's single accumulating-content-blocks Message
+-- per turn (checkpoint 2.3) already relied on there being exactly one
+-- ASSISTANT message per AgentRun; this index makes that invariant
+-- database-enforced, and gives two concurrent executeAgentTurn()
+-- invocations for the same run a real mutex (a P2002 on the loser,
+-- caught and treated as "a duplicate concurrent execution, exit
+-- skipped") instead of relying only on the PENDING-message read-check,
+-- which two truly concurrent executions can both pass before either has
+-- inserted anything.
+CREATE UNIQUE INDEX "Message_one_assistant_per_run" ON "Message"("agentRunId") WHERE "role" = 'ASSISTANT';

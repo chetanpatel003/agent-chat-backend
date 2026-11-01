@@ -34,7 +34,8 @@ never drift from the database's actual enum definitions.
 | `/api/v1/chats/[chatId]` | DELETE | Clerk bearer + ownership | → `{ id }`. Soft delete (`isDeleted = true`); the chat is gone from listing/retrieval but never hard-deleted. |
 | `/api/v1/chats/[chatId]/messages` | GET | Clerk bearer + ownership | `CursorPaginationRequestSchema` query → `PaginatedMessageResponseSchema` |
 | `/api/v1/chats/[chatId]/messages` | POST | Clerk bearer + ownership | **New.** Requires an `Idempotency-Key` header (required, not optional — see below). `SendMessageRequestSchema` body → `SendMessageResponseSchema`, 202. |
-| `/api/v1/chats/[chatId]/runs/active` | GET | Clerk bearer + ownership | **New.** → `AgentRunResponseSchema \| null`. The reconciliation endpoint — "is something in flight for this chat right now." |
+| `/api/v1/chats/[chatId]/runs/active` | GET | Clerk bearer + ownership | → `AgentRunResponseSchema \| null`. The reconciliation endpoint — "is something in flight for this chat right now." |
+| `/api/v1/chats/[chatId]/runs/[runId]/cancel` | POST | Clerk bearer + ownership | **New (checkpoint 2.4).** → `AgentRunResponseSchema`, 200. Idempotent — an already-terminal run is returned unchanged, no write, no Trigger.dev call. |
 | `/api/v1/credits/balance` | GET | Clerk bearer | → `CreditBalanceResponseSchema`. No account provisioned yet = 0, never auto-created by a GET. |
 | `/api/v1/credits/ledger` | GET | Clerk bearer | `CursorPaginationRequestSchema` query → `PaginatedCreditLedgerResponseSchema` |
 
@@ -246,6 +247,192 @@ deterministic, no external call, with a `simulateFailure` input field
 that exists purely to force the `execute()`-throws path on demand. Never
 registered into `PRODUCTION_TOOL_REGISTRY`; every test injects its own
 registry via `executeAgentTurn`'s second parameter.
+
+## Cancellation, atomic transitions, and realtime run events (checkpoint 2.4)
+
+**The problem this checkpoint closes:** every AgentRun/Message write
+before 2.4 was an unconditional `update()` — correct for the failure
+modes 2.2/2.3 designed around (a crash, a definite provider error), but
+not against a *second, independent writer* racing the worker: a
+cancellation request arriving mid-call, or (more remotely) two
+concurrent executions of the same run. An unconditional write can't tell
+"I'm the only one touching this row" from "someone else already decided
+its fate" — it just overwrites.
+
+**`src/services/run-transitions.ts`** — the one small, focused guarded-
+transition primitive this checkpoint introduces (deliberately not a
+state-machine framework): `casAgentRunStatus(agentRunId, from, data)`
+does `agentRun.updateMany({ where: { id, status: { in: from } }, data })`
+and reports `{ applied: true }` or `{ applied: false, currentStatus }` —
+the row's *real* current status, read back, not guessed. `readAgentRunStatus`
+is the read-only counterpart for the mid-loop check points below.
+`ACTIVE_RUN_STATUSES = [QUEUED, RUNNING, WAITING]` is the one shared
+`from` list every caller uses — a terminal status never belongs in it.
+`SkippedTransition` is a sentinel thrown inside a `$transaction` callback
+to abort it cleanly when a guarded sub-update inside affected zero rows.
+
+**Every AgentRun status write in `run-agent-turn.ts` and `agent-run.ts`
+now goes through this primitive — never a plain `update()`.** Allowed
+transitions: QUEUED/RUNNING → RUNNING (the narrow re-entry case where a
+prior attempt marked RUNNING but crashed before inserting the PENDING
+message), QUEUED/RUNNING/WAITING → COMPLETED/FAILED/CANCELLED. A guard
+that affects zero rows means another process already decided this run's
+fate; the caller backs off immediately, returning
+`{ status: currentStatus, skipped: true, ambiguous: false }` rather than
+writing or publishing anything further.
+
+**Atomic terminal writes.** `finalizeSuccess()` and
+`markDefiniteFailure()` (the latter also used for `TURN_LIMIT_EXCEEDED`)
+each wrap their Message + Chat + AgentRun writes in one `$transaction`:
+the Message update is itself guarded (`WHERE status = 'PENDING'`); if it
+affects zero rows (the cancel route already finalized this message), a
+`SkippedTransition` aborts the *whole* transaction — the AgentRun write
+never lands either. This is what makes "a crash cannot leave the
+assistant message terminal while AgentRun remains RUNNING, or vice
+versa" true structurally, not just by convention.
+
+**Three status checks inside the tool-calling loop**, all read-only
+(`readAgentRunStatus`), all short-circuiting to the same
+`{ status, skipped: true, ambiguous: false }` shape on anything but
+RUNNING:
+1. Top of each loop iteration, before calling the provider ("checked
+   between loop iterations").
+2. Immediately after the provider call returns — the critical window: a
+   cancellation could have landed in the database while the call was in
+   flight.
+3. Immediately before each individual tool call within a round.
+
+Message content is now persisted after *each* tool call, not batched
+once per round (checkpoint 2.3's behavior) — so a cancellation detected
+partway through a multi-tool-call round never loses an earlier call's
+already-finished result. This write touches only the `content` column,
+never `status`, so it's safe even racing a concurrent cancel (disjoint
+columns, no guard needed).
+
+**The real concurrency mutex is the database, not an in-process lock.**
+Two genuinely concurrent `executeAgentTurn()` calls for the same run can
+both pass every read-check above (neither has inserted its assistant
+message yet) and both reach `prisma.message.create()` — but the partial
+unique index `Message_one_assistant_per_run` (DATABASE.md) lets only one
+insert succeed. The loser's `P2002` (same empirically-verified
+`driverAdapterError.cause.constraint.index` shape as decisions/0009) is
+caught and treated as "a duplicate concurrent execution, exit skipped,"
+never touching AgentRun state. Verified with a real `Promise.all` of two
+`executeAgentTurn()` calls and a delayed mocked provider response to
+force genuine overlap — exactly one assistant message, exactly one
+provider call.
+
+**`src/services/agent-run.ts#cancelRun(userId, chatId, agentRunId)`** —
+`POST .../runs/[runId]/cancel`. Authenticates ownership through both the
+chat and the run (`requireAgentRunOwnership`), then additionally checks
+`run.chatId === chatId` — the run must belong to *this* chat, not just
+some chat this user owns — a 404 either way, never leaking which case
+applied. An already-terminal run is returned unchanged: no write, no
+Trigger.dev call (true idempotency, not just "safe to retry").
+Otherwise: one transaction CASes the AgentRun to CANCELLED
+(`errorCode: CANCELLED_BY_USER`) and, in the same transaction, moves a
+PENDING assistant message to CANCELLED *without touching its `content`*
+— whatever was already persisted survives exactly as it was. Only after
+that commits does it make a best-effort `runs.cancel(triggerRunId)` call
+(Trigger.dev SDK — verified below); a failure there is logged and never
+fails the request, since Postgres is already authoritative by that
+point and the worker's own guarded checks will catch a mid-call run
+regardless of whether the Trigger.dev-side cancellation lands.
+
+**AbortSignal investigated, found unavailable for this task shape.**
+The plain `task({ run })`'s context (`TaskRunContext`, re-exported from
+`@trigger.dev/core` as a Zod schema — read directly, not guessed from
+docs) has no `signal` field anywhere in its schema; the SDK's abort
+signals (`chat-server.d.ts`, `ai.d.ts`) only exist on the newer
+chat/streaming-agent helpers, a different API surface this task doesn't
+use. A separate `onCancel()` lifecycle hook exists (`hooks.d.ts`) but is
+a registered callback, not a signal passable to `fetch()` — wiring it
+into an ad hoc AbortController would be inventing architecture the
+checkpoint's scope explicitly excludes. Consequence: cancellation cannot
+interrupt an in-flight OpenRouter call; it's caught by the guarded
+status checks immediately before/after instead — which is what the
+active-provider-call cancellation test actually proves.
+
+**`src/contracts/run-event.ts`** — `RunEventSchema`, a discriminated
+union: `run_status`, `assistant_message` (a pointer to the message's
+`messageId`, never its content — renamed from Decision B's original
+`assistant_text` per this checkpoint's explicit override), `tool_started`,
+`tool_completed`, `tool_failed`. Every variant is `z.strictObject()` —
+an unexpected field (assistant text, tool input/output, a provider
+response) is a validation *failure*, not silently stripped; this is the
+actual enforcement mechanism behind "events never carry content,"
+proven by a contract test that asserts rejection, not just absence.
+`seq` is a monotonically increasing integer per execution.
+
+**`src/realtime/publish-run-event.ts`** — `publishRunEvent(event)`:
+validates, then calls Trigger.dev's own `metadata.append("events",
+event)` (verified against the installed SDK's declarations — this *is*
+Decision B's entire publishing interface, not a new event bus). Never
+throws: a validation failure or a `metadata.append` failure (confirmed
+empirically to throw "Method not implemented" when called outside a
+live task context — exactly the case in every test that doesn't inject
+its own publisher) is logged and swallowed. `createRunEventEmitter(runId,
+publish)` fills in `runId`/`seq`/`at` so call sites only supply what's
+event-specific, and wraps the *injected* publisher (which may be a test
+double) in its own try/catch too — isolation holds regardless of which
+publisher is in use.
+
+`executeAgentTurn(payload, registry, publish)` now takes `publish` as a
+third dependency-injected parameter, defaulting to the real
+`publishRunEvent` — same pattern as the tool registry (checkpoint 2.3),
+for the same reason: module-mocking Trigger.dev's own SDK was found
+fragile in checkpoint 2.2. Events are published strictly after their
+triggering database commit: RUNNING after the CAS succeeds;
+`assistant_message`+`run_status` after `finalizeSuccess`/
+`markDefiniteFailure`'s transaction commits; `tool_started`/
+`tool_completed`/`tool_failed` immediately after each corresponding
+ToolInvocation write inside `runOneToolCall`. Verified directly — a test
+publisher spy reads the database *inside* its own callback and asserts
+the expected state is already there for every event type.
+
+**Deliberate gap, not an oversight:** the realtime event list names
+CANCELLED among the `assistant_message` triggers, but the cancellation
+route is explicitly barred from publishing task metadata directly (it
+runs outside any task execution context, so `metadata.append` would
+target no run at all). CANCELLED visibility is REST-only — `GET
+.../runs/active` or the cancel response itself — never realtime. The
+worker itself also never publishes when it merely *detects* a
+cancellation mid-loop, since it caused no new transition of its own to
+announce.
+
+**A known, accepted trade-off, found by the concurrency test itself:**
+two truly concurrent in-process `executeAgentTurn()` calls for the same
+run can race between the "winner" (the one whose `message.create()`
+succeeds) completing normally and the "loser" discovering the winner's
+still-`PENDING` message via the stale-message re-entry check — which
+has no way to tell "a previous attempt crashed, abandoned" apart from
+"a sibling is actively, legitimately working on this right now" — and
+marking the run `FAILED`/`AMBIGUOUS_PROVIDER_OUTCOME` *before* the
+winner's own provider call resolves. When this happens, the winner's
+own guarded `finalizeSuccess` transaction correctly finds the run no
+longer active and backs off (its `AgentRun` sub-update affects zero
+rows) — so the outcome is never corrupted (still exactly one message,
+one provider call, one terminal state), but the specific terminal state
+can be the less-ideal one, discarding a perfectly good answer. **Not
+fixed in 2.4**, deliberately: a real fix needs genuine liveness
+information (a heartbeat/lease, or querying Trigger.dev's own run
+status) that doesn't exist anywhere in this design and wasn't in
+scope — "do not build a generic state-machine framework." It's accepted
+because Trigger.dev's own `idempotencyKey` plus its liveness-based
+retry semantics (a retry only fires once the platform has independently
+concluded the previous attempt is dead) mean this specific race
+essentially cannot happen between two *separate* Trigger.dev dispatches
+in production; the test exercises a more aggressive, synthetic
+same-process race than production ever produces.
+
+**Phase 3 prerequisite, not fixed in 2.4 (scope explicitly excludes
+changing `MAX_TURNS` behavior):** on the *last* allowed round, a
+`tool_calls` response is still executed even though its result can
+never be sent back to the model — the loop ends right after via
+`TURN_LIMIT_EXCEEDED`. Real external tool work (and credits) would be
+spent for nothing. Before registering real Magica tools, stop
+dispatching new tool calls once `turn === MAX_TURNS - 1` and go straight
+to the turn-limit failure instead.
 
 ## Pagination and search (checkpoint 1.3)
 - **Chat list:** `ORDER BY isPinned DESC, lastMessageAt DESC, id DESC`, keyset cursor on `(lastMessageAt, id)`. No index currently covers `isPinned` as a leading column — correct, not yet optimally indexed at scale; see decisions/0008.

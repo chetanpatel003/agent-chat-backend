@@ -2,7 +2,6 @@ import { wait } from "@trigger.dev/sdk";
 import { prisma } from "@/lib/prisma";
 import { getMagicaRun, MagicaPollInconclusiveError, type MagicaRunPoll } from "@/providers/magica";
 import { readAgentRunStatus } from "@/services/run-transitions";
-import type { ToolReconcileOutcome } from "@/tools/types";
 
 // Configurable via constants, not scattered magic numbers (per this
 // checkpoint's own instruction). Deliberately well under Trigger.dev's
@@ -66,9 +65,14 @@ export async function persistProviderRunId(
   return { applied: false, currentProviderRunId: current.providerRunId };
 }
 
-type PollOutcome =
-  | { status: "completed"; output: unknown }
-  | { status: "failed"; errorCode: string; errorMessage: string };
+// `creditUsed` (checkpoint 3.3) flows through from Magica's own poll
+// response, raw, for the caller to capture and persist as descriptive
+// data only — never converted or settled. The credit-estimation unit
+// discrepancy (project-docs/magica/CREDIT_ESTIMATION.md) remains
+// unresolved; this is explicitly not a credits-charged/ledger value.
+export type PollOutcome =
+  | { status: "completed"; output: unknown; creditUsed?: number }
+  | { status: "failed"; errorCode: string; errorMessage: string; creditUsed?: number };
 
 /**
  * Polls an already-started Magica run to completion, using Trigger.dev's
@@ -122,13 +126,14 @@ export async function pollMagicaRunToCompletion(params: {
     }
 
     if (poll.status === "COMPLETED") {
-      return { status: "completed", output: poll.output };
+      return { status: "completed", output: poll.output, creditUsed: poll.creditUsed };
     }
     if (poll.status === "FAILED" || poll.status === "CANCELED") {
       return {
         status: "failed",
         errorCode: poll.status === "FAILED" ? "MAGICA_RUN_FAILED" : "MAGICA_RUN_CANCELED",
         errorMessage: poll.userMessage ?? poll.error ?? `Magica run ended with status ${poll.status}`,
+        creditUsed: poll.creditUsed,
       };
     }
     // QUEUED/RUNNING, or any other, unrecognized status — explicitly
@@ -153,7 +158,7 @@ export async function pollMagicaRunToCompletion(params: {
 export async function reconcileMagicaRun(
   invocation: { id: string; providerRunId: string | null },
   waitFn: DurableWait = durableWait,
-): Promise<ToolReconcileOutcome<unknown>> {
+): Promise<PollOutcome> {
   if (!invocation.providerRunId) {
     throw new MagicaPollInconclusiveError(
       "No providerRunId was ever persisted for this invocation; cannot reconcile and must not start a new run",

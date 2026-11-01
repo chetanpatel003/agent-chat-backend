@@ -50,9 +50,6 @@ importers:
       standardwebhooks:
         specifier: ^1.1.1
         version: 1.1.1
-      svix:
-        specifier: ^2.9.1
-        version: 2.9.1
       zod:
         specifier: 4.3.3
         version: 4.3.3
@@ -4048,10 +4045,6 @@ packages:
   supports-preserve-symlinks-flag@1.0.0:
     resolution: {integrity: sha512-ot0WnXS9fgdkgIcePe6RHNk1WA8+muPa6cSjeR3V8K27q9BB1rTE3R1p7Hv0z1ZyAc8s6Vvv8DIyWf681MAt0w==}
     engines: {node: '>= 0.4'}
-
-  svix@2.9.1:
-    resolution: {integrity: sha512-qeIouYbC4b2nnMAG9hKxglGh1hYlLyMt6HIg+pNqdNkj5T99a9tnhw4pV/mROPSCVGXv1rCBTUVdym3Y5R+UDA==}
-    engines: {node: '>=22'}
 
   systeminformation@5.33.19:
     resolution: {integrity: sha512-Zm7wGeCG7PqfvzegMJIzrxICopWqYCeLATVmvxOOci1isLcNVKgY4Fr0hhYQzvc7cgtK3377jQVChTFAnznOiA==}
@@ -8527,10 +8520,6 @@ snapshots:
       has-flag: 4.0.0
 
   supports-preserve-symlinks-flag@1.0.0: {}
-
-  svix@2.9.1:
-    dependencies:
-      standardwebhooks: 1.1.1
 
   systeminformation@5.33.19: {}
 

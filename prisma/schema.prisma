@@ -1,7 +1,9 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
+// Checkpoint 1.1 — database foundation.
+// 9 required entities only: User, CreditAccount, CreditLedger, Chat, Message,
+// AgentRun, ToolInvocation, Waitpoint, Attachment.
+// Deferred to a later checkpoint (not in this checkpoint's required list):
+// RunSkill (skills durability), full-text search index on Chat.
+// See project-docs/decisions/0006-checkpoint-1.1-scope-trim.md
 
 generator client {
   provider = "prisma-client"
@@ -10,4 +12,274 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+// ---------- Identity & credits ----------
+
+model User {
+  id          String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  clerkUserId String   @unique
+  email       String
+  displayName String?
+  imageUrl    String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  creditAccount CreditAccount?
+  creditLedger  CreditLedger[]
+  chats         Chat[]
+  messages      Message[]
+  agentRuns     AgentRun[]
+  attachments   Attachment[]
+}
+
+model CreditAccount {
+  id        String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  userId    String   @unique @db.Uuid
+  balance   BigInt   @default(0)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+enum CreditLedgerType {
+  GRANT
+  TOOL_CHARGE
+  REFUND
+  ADJUSTMENT
+}
+
+model CreditLedger {
+  id               String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  userId           String           @db.Uuid
+  amount           BigInt
+  type             CreditLedgerType
+  idempotencyKey   String           @unique
+  toolInvocationId String?          @db.Uuid
+  balanceAfter     BigInt
+  description      String
+  createdAt        DateTime         @default(now()) @db.Timestamptz(6)
+
+  user           User            @relation(fields: [userId], references: [id])
+  toolInvocation ToolInvocation? @relation(fields: [toolInvocationId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([toolInvocationId])
+}
+
+// ---------- Conversation ----------
+
+model Chat {
+  id            String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  userId        String   @db.Uuid
+  title         String?
+  isPinned      Boolean  @default(false)
+  isDeleted     Boolean  @default(false)
+  lastMessageAt DateTime @default(now()) @db.Timestamptz(6)
+  createdAt     DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(6)
+
+  user        User         @relation(fields: [userId], references: [id])
+  messages    Message[]
+  agentRuns   AgentRun[]
+  attachments Attachment[]
+
+  @@index([userId, isDeleted, lastMessageAt(sort: Desc), id(sort: Desc)])
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+  TOOL
+}
+
+enum MessageStatus {
+  PENDING
+  STREAMING
+  COMPLETE
+  FAILED
+  CANCELLED
+}
+
+model Message {
+  id         String        @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  chatId     String        @db.Uuid
+  userId     String        @db.Uuid
+  agentRunId String?       @db.Uuid
+  role       MessageRole
+  status     MessageStatus @default(COMPLETE)
+  content    Json
+  createdAt  DateTime      @default(now()) @db.Timestamptz(6)
+
+  chat     Chat      @relation(fields: [chatId], references: [id])
+  user     User      @relation(fields: [userId], references: [id])
+  agentRun AgentRun? @relation(fields: [agentRunId], references: [id])
+
+  toolInvocations ToolInvocation[]
+  attachments     Attachment[]
+
+  @@index([chatId, createdAt, id])
+  @@index([agentRunId])
+}
+
+// ---------- Agent run ----------
+
+enum AgentRunStatus {
+  QUEUED
+  RUNNING
+  WAITING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum WaitingReason {
+  APPROVAL
+  PLAN
+  CREDIT
+  MEDIA
+}
+
+model AgentRun {
+  id               String         @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  chatId           String         @db.Uuid
+  userId           String         @db.Uuid
+  idempotencyKey   String         @unique
+  triggerRunId     String?        @unique
+  status           AgentRunStatus @default(QUEUED)
+  waitingReason    WaitingReason?
+  model            String?
+  promptTokens     Int?
+  completionTokens Int?
+  turnCount        Int            @default(0)
+  retryOfRunId     String?        @db.Uuid
+  errorCode        String?
+  errorMessage     String?
+  startedAt        DateTime?      @db.Timestamptz(6)
+  completedAt      DateTime?      @db.Timestamptz(6)
+  createdAt        DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime       @updatedAt @db.Timestamptz(6)
+
+  chat    Chat      @relation(fields: [chatId], references: [id])
+  user    User      @relation(fields: [userId], references: [id])
+  retryOf AgentRun? @relation("RunRetry", fields: [retryOfRunId], references: [id])
+  retries AgentRun[] @relation("RunRetry")
+
+  messages        Message[]
+  toolInvocations ToolInvocation[]
+  waitpoints      Waitpoint[]
+
+  // One active run per chat — Prisma's schema language can't express a
+  // partial unique index; enforced via raw SQL added to the generated
+  // migration. See project-docs/DATABASE.md.
+  @@index([chatId, createdAt])
+}
+
+enum ToolInvocationStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model ToolInvocation {
+  id               String               @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  agentRunId       String               @db.Uuid
+  messageId        String?              @db.Uuid
+  toolName         String
+  idempotencyKey   String               @unique
+  input            Json
+  output           Json?
+  status           ToolInvocationStatus @default(PENDING)
+  providerRunId    String?              @unique
+  triggerTaskRunId String?
+  durationMs       Int?
+  creditsCharged   BigInt?
+  errorCode        String?
+  errorMessage     String?
+  createdAt        DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime             @updatedAt @db.Timestamptz(6)
+
+  agentRun AgentRun @relation(fields: [agentRunId], references: [id])
+  message  Message? @relation(fields: [messageId], references: [id])
+
+  creditLedgerEntries CreditLedger[]
+
+  @@index([agentRunId, createdAt])
+}
+
+enum WaitpointType {
+  APPROVAL
+  PLAN
+  CREDIT
+  MEDIA
+}
+
+enum WaitpointStatus {
+  PENDING
+  RESOLVED
+  EXPIRED
+  CANCELLED
+}
+
+model Waitpoint {
+  id             String          @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  agentRunId     String          @db.Uuid
+  token          String          @unique
+  type           WaitpointType
+  status         WaitpointStatus @default(PENDING)
+  payload        Json
+  resolution     Json?
+  idempotencyKey String          @unique
+  expiresAt      DateTime?       @db.Timestamptz(6)
+  resolvedAt     DateTime?       @db.Timestamptz(6)
+  createdAt      DateTime        @default(now()) @db.Timestamptz(6)
+
+  agentRun AgentRun @relation(fields: [agentRunId], references: [id])
+
+  @@index([agentRunId])
+}
+
+// ---------- Media ----------
+
+enum AttachmentSource {
+  UPLOAD
+  GENERATED
+}
+
+enum AttachmentStatus {
+  PENDING
+  UPLOADING
+  PROCESSING
+  READY
+  FAILED
+  EXPIRED
+}
+
+model Attachment {
+  id                String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  userId            String           @db.Uuid
+  chatId            String?          @db.Uuid
+  messageId         String?          @db.Uuid
+  source            AttachmentSource
+  assemblyId        String?
+  providerRunId     String?
+  status            AttachmentStatus @default(PENDING)
+  mimeType          String
+  sizeBytes         BigInt?
+  url               String?
+  sanitizedMetadata Json             @default("{}")
+  order             Int
+  createdAt         DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime         @updatedAt @db.Timestamptz(6)
+
+  user    User     @relation(fields: [userId], references: [id])
+  chat    Chat?    @relation(fields: [chatId], references: [id])
+  message Message? @relation(fields: [messageId], references: [id])
+
+  @@index([messageId, order])
+  @@index([chatId])
 }

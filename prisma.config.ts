@@ -9,6 +9,11 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   datasource: {
-    url: process.env["DATABASE_URL"],
+    // CLI-only (migrate/validate/introspect). Prisma 7 has no directUrl field
+    // here — this governs the CLI, not the app. The app's own runtime
+    // PrismaClient (via @prisma/adapter-pg, not written yet) uses the
+    // pooled DATABASE_URL instead; Neon's pooler doesn't support the
+    // session behavior `migrate` needs (confirmed: P1001 against it).
+    url: process.env["DIRECT_DATABASE_URL"],
   },
 });

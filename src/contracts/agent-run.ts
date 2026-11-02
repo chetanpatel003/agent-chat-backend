@@ -27,5 +27,20 @@ export const AgentRunResponseSchema = z.object({
   completedAt: z.iso.datetime().nullable(),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
+  // Checkpoint 3.4.2 — the Trigger.dev run id a client needs to open a
+  // realtime subscription. Already existed on the AgentRun row since
+  // checkpoint 1.1; never exposed in this response until a frontend
+  // consumer needed it. Null until dispatch completes (a brief window
+  // during admission) or if dispatch never happened.
+  triggerRunId: z.string().nullable(),
 });
 export type AgentRunResponse = z.infer<typeof AgentRunResponseSchema>;
+
+// Checkpoint 3.4.2 — a short-lived, narrowly-scoped Trigger.dev public
+// access token (read-only, scoped to exactly one run) that a browser
+// can safely hold. Minted server-side only: generating it requires
+// the Trigger.dev secret key, which must never reach the client.
+export const RealtimeTokenResponseSchema = z.object({
+  token: z.string(),
+});
+export type RealtimeTokenResponse = z.infer<typeof RealtimeTokenResponseSchema>;

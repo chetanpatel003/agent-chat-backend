@@ -6,3 +6,4 @@ export * from "./message";
 export * from "./agent-run";
 export * from "./attachment";
 export * from "./credits";
+export * from "./run-event";

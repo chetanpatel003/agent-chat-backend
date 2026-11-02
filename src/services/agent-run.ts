@@ -1,9 +1,9 @@
-import { runs } from "@trigger.dev/sdk";
+import { runs, auth } from "@trigger.dev/sdk";
 import { prisma } from "@/lib/prisma";
 import { requireChatOwnership, requireAgentRunOwnership } from "@/services/ownership";
 import { ACTIVE_RUN_STATUSES, SkippedTransition } from "@/services/run-transitions";
-import { NotFoundError } from "@/lib/errors";
-import type { AgentRunResponse } from "@/contracts/agent-run";
+import { NotFoundError, ValidationError } from "@/lib/errors";
+import type { AgentRunResponse, RealtimeTokenResponse } from "@/contracts/agent-run";
 import type { AgentRun } from "@/generated/prisma/client";
 import type { AgentRunStatus } from "@/generated/prisma/enums";
 
@@ -25,6 +25,7 @@ function toAgentRunResponse(run: AgentRun): AgentRunResponse {
     completedAt: run.completedAt?.toISOString() ?? null,
     createdAt: run.createdAt.toISOString(),
     updatedAt: run.updatedAt.toISOString(),
+    triggerRunId: run.triggerRunId,
   };
 }
 
@@ -40,6 +41,34 @@ export async function getActiveRun(
     where: { chatId, status: { in: ACTIVE_RUN_STATUSES } },
   });
   return run ? toAgentRunResponse(run) : null;
+}
+
+/**
+ * Mints a short-lived, read-only Trigger.dev public access token scoped
+ * to exactly this one run — the only way a browser can open a realtime
+ * subscription without ever holding the Trigger.dev secret key (which
+ * stays server-side; see node_modules' own auth.d.ts for the API this
+ * wraps). 1h expiration: comfortably longer than any real chat turn
+ * (observed this trial: 10–33s), short enough to bound exposure if a
+ * token were somehow retained past the page that requested it.
+ */
+export async function getRealtimeToken(
+  userId: string,
+  chatId: string,
+  agentRunId: string,
+): Promise<RealtimeTokenResponse> {
+  await requireChatOwnership(userId, chatId);
+  const run = await requireAgentRunOwnership(userId, agentRunId);
+  if (run.chatId !== chatId) throw new NotFoundError("Agent run not found");
+  if (!run.triggerRunId) {
+    throw new ValidationError("This run has not been dispatched yet");
+  }
+
+  const token = await auth.createPublicToken({
+    scopes: { read: { runs: [run.triggerRunId] } },
+    expirationTime: "1h",
+  });
+  return { token };
 }
 
 /**

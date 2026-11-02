@@ -1,19 +1,23 @@
 import { describe, it, expect, afterAll, vi, beforeEach } from "vitest";
 import { randomUUID } from "node:crypto";
 
-// cancelRun's best-effort Trigger.dev call — mocked everywhere in this
-// file (never a real call) since most of these AgentRun rows are
-// created directly, never actually dispatched, and the one test that
-// does care about this call asserts against the mock directly.
-vi.mock("@trigger.dev/sdk", () => ({ runs: { cancel: vi.fn() } }));
+// cancelRun's best-effort Trigger.dev call and getRealtimeToken's
+// token-minting call — both mocked everywhere in this file (never a
+// real call against Trigger.dev's API) since most of these AgentRun
+// rows are created directly, never actually dispatched.
+vi.mock("@trigger.dev/sdk", () => ({
+  runs: { cancel: vi.fn() },
+  auth: { createPublicToken: vi.fn() },
+}));
 
-import { runs } from "@trigger.dev/sdk";
+import { runs, auth } from "@trigger.dev/sdk";
 import { prisma } from "@/lib/prisma";
-import { NotFoundError } from "@/lib/errors";
+import { NotFoundError, ValidationError } from "@/lib/errors";
 import { makeTestUser, cleanupTestUsers } from "@/test-utils/db-fixtures";
-import { getActiveRun, cancelRun } from "./agent-run";
+import { getActiveRun, cancelRun, getRealtimeToken } from "./agent-run";
 
 const mockCancel = vi.mocked(runs.cancel);
+const mockCreatePublicToken = vi.mocked(auth.createPublicToken);
 
 const createdUserIds: string[] = [];
 afterAll(() => cleanupTestUsers(createdUserIds));
@@ -31,16 +35,34 @@ describe("getActiveRun", () => {
     expect(await getActiveRun(owner.id, chat.id)).toBeNull();
   });
 
-  it("returns the active run when one exists", async () => {
+  it("returns the active run when one exists, including its triggerRunId", async () => {
     const owner = await user("active-some");
     const chat = await prisma.chat.create({ data: { userId: owner.id } });
     const run = await prisma.agentRun.create({
-      data: { chatId: chat.id, userId: owner.id, idempotencyKey: randomUUID(), status: "RUNNING" },
+      data: {
+        chatId: chat.id,
+        userId: owner.id,
+        idempotencyKey: randomUUID(),
+        status: "RUNNING",
+        triggerRunId: `run_${randomUUID()}`,
+      },
     });
 
     const result = await getActiveRun(owner.id, chat.id);
     expect(result?.id).toBe(run.id);
     expect(result?.status).toBe("RUNNING");
+    expect(result?.triggerRunId).toBe(run.triggerRunId);
+  });
+
+  it("reports a null triggerRunId during the brief post-admission window before dispatch completes", async () => {
+    const owner = await user("active-no-trigger-yet");
+    const chat = await prisma.chat.create({ data: { userId: owner.id } });
+    await prisma.agentRun.create({
+      data: { chatId: chat.id, userId: owner.id, idempotencyKey: randomUUID(), status: "QUEUED" },
+    });
+
+    const result = await getActiveRun(owner.id, chat.id);
+    expect(result?.triggerRunId).toBeNull();
   });
 
   it("does not return a terminal run as active", async () => {
@@ -194,5 +216,71 @@ describe("cancelRun", () => {
 
     const result = await cancelRun(owner.id, chat.id, run.id);
     expect(result.status).toBe("CANCELLED");
+  });
+});
+
+describe("getRealtimeToken", () => {
+  beforeEach(() => {
+    mockCreatePublicToken.mockReset();
+    mockCreatePublicToken.mockResolvedValue("tok_fake");
+  });
+
+  it("mints a token scoped to exactly this run's triggerRunId, with a 1h expiration", async () => {
+    const owner = await user("token-happy-path");
+    const chat = await prisma.chat.create({ data: { userId: owner.id } });
+    const triggerRunId = `run_${randomUUID()}`;
+    const run = await prisma.agentRun.create({
+      data: { chatId: chat.id, userId: owner.id, idempotencyKey: randomUUID(), status: "RUNNING", triggerRunId },
+    });
+
+    const result = await getRealtimeToken(owner.id, chat.id, run.id);
+    expect(result).toEqual({ token: "tok_fake" });
+    expect(mockCreatePublicToken).toHaveBeenCalledWith({
+      scopes: { read: { runs: [triggerRunId] } },
+      expirationTime: "1h",
+    });
+  });
+
+  it("refuses to mint a token for a run that has not been dispatched yet (no triggerRunId)", async () => {
+    const owner = await user("token-no-dispatch");
+    const chat = await prisma.chat.create({ data: { userId: owner.id } });
+    const run = await prisma.agentRun.create({
+      data: { chatId: chat.id, userId: owner.id, idempotencyKey: randomUUID(), status: "QUEUED" },
+    });
+
+    await expect(getRealtimeToken(owner.id, chat.id, run.id)).rejects.toThrow(ValidationError);
+    expect(mockCreatePublicToken).not.toHaveBeenCalled();
+  });
+
+  it("rejects a different user with a non-leaking 404", async () => {
+    const owner = await user("token-owner");
+    const intruder = await user("token-intruder");
+    const chat = await prisma.chat.create({ data: { userId: owner.id } });
+    const run = await prisma.agentRun.create({
+      data: {
+        chatId: chat.id,
+        userId: owner.id,
+        idempotencyKey: randomUUID(),
+        status: "RUNNING",
+        triggerRunId: `run_${randomUUID()}`,
+      },
+    });
+    await expect(getRealtimeToken(intruder.id, chat.id, run.id)).rejects.toThrow(NotFoundError);
+  });
+
+  it("rejects a run that belongs to a different chat than the one named in the URL", async () => {
+    const owner = await user("token-wrong-chat");
+    const chatA = await prisma.chat.create({ data: { userId: owner.id } });
+    const chatB = await prisma.chat.create({ data: { userId: owner.id } });
+    const run = await prisma.agentRun.create({
+      data: {
+        chatId: chatA.id,
+        userId: owner.id,
+        idempotencyKey: randomUUID(),
+        status: "RUNNING",
+        triggerRunId: `run_${randomUUID()}`,
+      },
+    });
+    await expect(getRealtimeToken(owner.id, chatB.id, run.id)).rejects.toThrow(NotFoundError);
   });
 });

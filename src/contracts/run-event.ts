@@ -2,10 +2,12 @@ import { z } from "zod";
 import { AgentRunStatusSchema } from "./agent-run";
 import { MessageStatusSchema } from "./message";
 
-// Backend-internal, published into Trigger.dev run metadata
-// (realtime/publish-run-event.ts), per PHASE2-PLAN.md §Decision B.
-// Nothing in the frontend consumes this yet — that's the later realtime
-// checkpoint. Turn-level events only, no token-level streaming deltas.
+// Published into Trigger.dev run metadata (realtime/publish-run-event.ts),
+// per PHASE2-PLAN.md §Decision B. Consumed by the frontend starting
+// checkpoint 3.4.2 (src/hooks/use-run-activity.ts, agent-chat-frontend)
+// via @trigger.dev/react-hooks' useRealtimeRun, reading this same shape
+// back out of the subscribed run's own metadata. Turn-level events
+// only, no token-level streaming deltas.
 //
 // Every variant uses z.strictObject(): an extra field is a validation
 // FAILURE, not silently stripped. That is the enforcement mechanism for

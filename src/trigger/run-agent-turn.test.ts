@@ -42,11 +42,11 @@ function toolCall(name: string, args: Record<string, unknown> | string, id = ran
 }
 
 function finalAnswer(text: string) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: null, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: null, promptTokens: 1, completionTokens: 1 };
 }
 
 function toolRequest(calls: ProviderToolCall[], text: string | null = null) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
 }
 
 beforeEach(() => mockCallOpenRouter.mockReset());
@@ -111,6 +111,8 @@ describe("executeAgentTurn — success", () => {
   it("transitions PENDING -> COMPLETE, persists content and the actual routed model", async () => {
     const owner = await user("turn-success");
     const { chat, run } = await setUpRun(owner);
+    // A stray `reasoning` field (as if an adapter regressed and leaked it)
+    // must still never reach persisted user-visible content.
     mockCallOpenRouter.mockResolvedValueOnce({
       model: "nvidia/nemotron-3.5-super-vl:free",
       text: "pong",
@@ -118,7 +120,7 @@ describe("executeAgentTurn — success", () => {
       toolCalls: null,
       promptTokens: 24,
       completionTokens: 49,
-    });
+    } as Awaited<ReturnType<typeof callOpenRouter>>);
 
     const result = await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
     expect(result.status).toBe("COMPLETED");
@@ -133,10 +135,8 @@ describe("executeAgentTurn — success", () => {
       where: { agentRunId: run.id, role: "ASSISTANT" },
     });
     expect(assistantMsg.status).toBe("COMPLETE");
-    expect(assistantMsg.content).toEqual([
-      { type: "thinking", text: "brief reasoning" },
-      { type: "text", text: "pong" },
-    ]);
+    expect(assistantMsg.content).toEqual([{ type: "text", text: "pong" }]);
+    expect(JSON.stringify(assistantMsg.content)).not.toContain("brief reasoning");
 
     const updatedChat = await prisma.chat.findUniqueOrThrow({ where: { id: chat.id } });
     expect(updatedChat.lastMessageAt.getTime()).toBeGreaterThanOrEqual(
@@ -152,7 +152,6 @@ describe("executeAgentTurn — success", () => {
     mockCallOpenRouter.mockResolvedValueOnce({
       model: "x/y:free",
       text: "ok",
-      reasoning: null,
       toolCalls: null,
       promptTokens: 1,
       completionTokens: 1,
@@ -279,7 +278,6 @@ describe("executeAgentTurn — terminal re-entry / duplicate dispatch", () => {
     mockCallOpenRouter.mockResolvedValueOnce({
       model: "x/y:free",
       text: "first",
-      reasoning: null,
       toolCalls: null,
       promptTokens: 1,
       completionTokens: 1,

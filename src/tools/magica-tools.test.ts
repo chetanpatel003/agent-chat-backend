@@ -53,10 +53,10 @@ function toolCall(name: string, args: Record<string, unknown>, id = randomUUID()
   return { id, type: "function", function: { name, arguments: JSON.stringify(args) } };
 }
 function finalAnswer(text: string) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: null, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: null, promptTokens: 1, completionTokens: 1 };
 }
 function toolRequest(calls: ProviderToolCall[], text: string | null = null) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
 }
 function pollResult(overrides: Partial<Record<string, unknown>> = {}) {
   return { id: "x", nodeType: "gpt_image_2", status: "RUNNING", createdAt: "2026-01-01T00:00:00Z", ...overrides };

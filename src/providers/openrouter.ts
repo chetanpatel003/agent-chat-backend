@@ -3,10 +3,11 @@ import { z } from "zod";
 // Real response shapes confirmed against two live openrouter/free calls
 // (see project-docs/decisions/0010) — not guessed from docs, which don't
 // document whether `model` reflects the actual routed model or a
-// `reasoning` field separate from `content`. Both are real and load-
-// bearing: `model` genuinely varies per request (two calls returned two
-// different underlying models) and `content` can be null when the
-// model spends its whole token budget on `reasoning`.
+// `reasoning` field separate from `content`. `model` genuinely varies
+// per request (two calls returned two different underlying models).
+// `reasoning` is the model's private scratch work (tool selection,
+// parameter construction) and is deliberately dropped here: it is never
+// returned, persisted, rendered, or substituted for a null `content`.
 //
 // The tool-calling request/response shapes added this checkpoint
 // (`tools`, `tool_calls`, the `tool` message role) are NOT independently
@@ -49,7 +50,6 @@ export type OpenRouterTurnResult = {
    * per-request against the real API. */
   model: string;
   text: string | null;
-  reasoning: string | null;
   /** Non-null exactly when the model is requesting one or more tool
    * calls instead of (or alongside) a text answer. */
   toolCalls: ProviderToolCall[] | null;
@@ -102,7 +102,6 @@ const ToolCallSchema = z.object({
 const MessageSchema = z
   .object({
     content: z.string().nullable(),
-    reasoning: z.string().nullable().optional(),
     tool_calls: z.array(ToolCallSchema).optional(),
   })
   .refine(
@@ -240,9 +239,10 @@ export async function callOpenRouter(
   }
 
   const text = choices[0].message.content?.trim() || null;
-  const reasoning = choices[0].message.reasoning?.trim() || null;
   const toolCalls = choices[0].message.tool_calls?.length ? choices[0].message.tool_calls : null;
-  if (!text && !reasoning && !toolCalls) {
+  // A reasoning-only response (content null, no tool calls) has nothing
+  // user-visible or actionable, so it is empty, not a success.
+  if (!text && !toolCalls) {
     throw new OpenRouterDefiniteError(
       "OpenRouter returned an empty response",
       "EMPTY_RESPONSE",
@@ -252,7 +252,6 @@ export async function callOpenRouter(
   return {
     model,
     text,
-    reasoning,
     toolCalls,
     promptTokens: usage.prompt_tokens,
     completionTokens: usage.completion_tokens,

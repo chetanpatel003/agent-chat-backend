@@ -106,6 +106,28 @@ describe("listMessages", () => {
     expect(page.items.map((m) => m.id)).toEqual(expectedOrder);
   });
 
+  it("strips previously persisted thinking/reasoning blocks from the response payload", async () => {
+    const owner = await user("strip-reasoning");
+    const chat = await prisma.chat.create({ data: { userId: owner.id } });
+    await prisma.message.create({
+      data: {
+        chatId: chat.id,
+        userId: owner.id,
+        role: "ASSISTANT",
+        content: [
+          { type: "thinking", text: "Let me check the available tools." },
+          { type: "reasoning", text: "private summary" },
+          { type: "text", text: "Hello!" },
+        ],
+      },
+    });
+
+    const page = await listMessages(owner.id, chat.id, { limit: 10 });
+    expect(page.items[0].content).toEqual([{ type: "text", text: "Hello!" }]);
+    expect(JSON.stringify(page)).not.toContain("Let me check the available tools.");
+    expect(JSON.stringify(page)).not.toContain("private summary");
+  });
+
   it("returns an empty page for a chat with no messages", async () => {
     const owner = await user("empty-history");
     const chat = await prisma.chat.create({ data: { userId: owner.id } });

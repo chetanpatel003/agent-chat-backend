@@ -21,7 +21,11 @@ function toMessageResponse(message: Message): MessageResponse {
     // this is still a real trust boundary per "Zod at every trust
     // boundary": a response is never shipped on the assumption that
     // whatever's in the column already matches the contract.
-    content: MessageContentSchema.parse(message.content),
+    // thinking/reasoning blocks hold private model reasoning persisted by
+    // older turns; they are never part of the user-visible payload.
+    content: MessageContentSchema.parse(message.content).filter(
+      (block) => block.type !== "thinking" && block.type !== "reasoning",
+    ),
     createdAt: message.createdAt.toISOString(),
   };
 }

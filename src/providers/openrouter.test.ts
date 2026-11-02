@@ -48,17 +48,18 @@ function realShapeSuccess(overrides: Record<string, unknown> = {}) {
 }
 
 describe("callOpenRouter — success", () => {
-  it("returns the real routed model, text, reasoning, and token usage", async () => {
+  it("returns the real routed model, content as text, and token usage — never the reasoning alongside it", async () => {
     server.use(http.post(URL, () => HttpResponse.json(realShapeSuccess())));
     const result = await callOpenRouter([{ role: "user", content: "ping" }]);
     expect(result.model).toBe("nvidia/nemotron-3.5-super-vl:free");
     expect(result.text).toBe("pong");
-    expect(result.reasoning).toBe("The user wants a one-word reply.");
     expect(result.promptTokens).toBe(24);
     expect(result.completionTokens).toBe(49);
+    expect(result).not.toHaveProperty("reasoning");
+    expect(JSON.stringify(result)).not.toContain("The user wants a one-word reply.");
   });
 
-  it("handles content: null with only reasoning present — a real shape, confirmed live, not hypothetical", async () => {
+  it("treats content: null with only reasoning (a real live shape) as EMPTY_RESPONSE — never substitutes reasoning for content", async () => {
     server.use(
       http.post(URL, () =>
         HttpResponse.json(
@@ -74,9 +75,10 @@ describe("callOpenRouter — success", () => {
         ),
       ),
     );
-    const result = await callOpenRouter([{ role: "user", content: "ping" }]);
-    expect(result.text).toBeNull();
-    expect(result.reasoning).toBe("Here's a thinking process:");
+    await expect(callOpenRouter([{ role: "user", content: "ping" }])).rejects.toMatchObject({
+      name: "OpenRouterDefiniteError",
+      code: "EMPTY_RESPONSE",
+    });
   });
 
   it("refuses a response that didn't actually route to a free model, even though it's otherwise well-formed", async () => {
@@ -89,7 +91,7 @@ describe("callOpenRouter — success", () => {
     });
   });
 
-  it("treats a response with neither content nor reasoning as a definite failure, not a silent empty success", async () => {
+  it("treats a response with neither content nor tool calls as a definite failure, not a silent empty success", async () => {
     server.use(
       http.post(URL, () =>
         HttpResponse.json(
@@ -189,7 +191,7 @@ describe("callOpenRouter — tool calling", () => {
     expect(capturedBody?.tools).toEqual(tools);
   });
 
-  it("parses tool_calls out of the response, leaving text/reasoning null", async () => {
+  it("parses tool_calls out of the response, leaving text null", async () => {
     server.use(
       http.post(URL, () =>
         HttpResponse.json(
@@ -226,7 +228,37 @@ describe("callOpenRouter — tool calling", () => {
     ]);
   });
 
-  it("does not treat a tool_calls-only response (no text, no reasoning) as empty", async () => {
+  it("returns tool calls from a response that also carries reasoning, without exposing the reasoning", async () => {
+    server.use(
+      http.post(URL, () =>
+        HttpResponse.json(
+          realShapeSuccess({
+            choices: [
+              {
+                index: 0,
+                finish_reason: "tool_calls",
+                message: {
+                  role: "assistant",
+                  content: null,
+                  reasoning: "I should call generate_image with prompt 'Kashmir'.",
+                  tool_calls: [
+                    { id: "call_r", type: "function", function: { name: "generate_image", arguments: "{}" } },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+      ),
+    );
+    const result = await callOpenRouter([{ role: "user", content: "x" }]);
+    expect(result.text).toBeNull();
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result).not.toHaveProperty("reasoning");
+    expect(JSON.stringify(result)).not.toContain("I should call generate_image");
+  });
+
+  it("does not treat a tool_calls-only response (no text) as empty", async () => {
     server.use(
       http.post(URL, () =>
         HttpResponse.json(
@@ -250,7 +282,7 @@ describe("callOpenRouter — tool calling", () => {
     );
     await expect(
       callOpenRouter([{ role: "user", content: "x" }]),
-    ).resolves.toMatchObject({ text: null, reasoning: null });
+    ).resolves.toMatchObject({ text: null });
   });
 
   it("returns toolCalls: null for an ordinary text response", async () => {

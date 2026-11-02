@@ -736,10 +736,8 @@ export async function executeAgentTurn(
       return { status: afterCall, skipped: true as const, ambiguous: false as const };
     }
 
-    // Pushed unconditionally, before branching on tool_calls: any
-    // narration the model gives alongside a tool request ("Let me check
-    // that...") is captured too, not just the final answer's text.
-    if (result.reasoning) content.push({ type: "thinking", text: result.reasoning });
+    // Pushed before branching on tool_calls so user-visible `content`
+    // sent alongside a tool request is kept, not just the final answer.
     if (result.text) content.push({ type: "text", text: result.text });
 
     if (!result.toolCalls) {

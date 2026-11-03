@@ -1,4 +1,4 @@
-import type { ToolProgressPhase } from "@/contracts/run-event";
+import type { ToolDisplay, ToolProgressPhase } from "@/contracts/run-event";
 import type { ZodType } from "zod";
 
 export type ToolExecutionContext = {
@@ -86,6 +86,8 @@ export class ProviderOutcomeUnknownError extends ToolExecutionError {
 export type ToolDefinition<TInput = unknown, TOutput = unknown> = {
   name: string;
   description: string;
+  /** User-facing name and activity label for status lines (src/tools/display.ts). */
+  display?: ToolDisplay;
   inputSchema: ZodType<TInput>;
   outputSchema: ZodType<TOutput>;
   execute: (input: TInput, context: ToolExecutionContext) => Promise<TOutput>;

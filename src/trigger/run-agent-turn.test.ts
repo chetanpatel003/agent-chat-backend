@@ -1040,6 +1040,75 @@ describe("executeAgentTurn — realtime publishing (publish-after-commit)", () =
   });
 });
 
+describe("executeAgentTurn — tool status lifecycle (labels only, real phase events)", () => {
+  const toolEventsOf = (publish: ReturnType<typeof vi.fn>) =>
+    publish.mock.calls
+      .map(([e]) => e as { type: string; phase?: string; toolName?: string; display?: unknown })
+      .filter((e) => e.type.startsWith("tool_"));
+
+  it("success: started (with display) → provider activity → receiving → saving → completed, in order", async () => {
+    const owner = await user("lifecycle-success");
+    const { run } = await setUpRun(owner);
+    // A provider-backed tool reports its own activity once the job is accepted.
+    const tool = {
+      ...fixtureTool,
+      display: { name: "Clock", activity: "Reading the clock" },
+      execute: vi.fn(async (input: { timezone: string }, ctx: { onProgress?: (p: "provider_waiting") => Promise<void> }) => {
+        await ctx.onProgress?.("provider_waiting");
+        return fixtureTool.execute(input as never, ctx as never);
+      }),
+    };
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([toolCall(FIXTURE_TOOL_NAME, { timezone: "UTC" })]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    const publish = vi.fn(async () => {});
+
+    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([tool as never]), publish);
+
+    const events = toolEventsOf(publish);
+    expect(events.map((e) => (e.type === "tool_progress" ? `progress:${e.phase}` : e.type))).toEqual([
+      "tool_started",
+      "progress:provider_waiting",
+      "progress:receiving",
+      "progress:saving",
+      "tool_completed",
+    ]);
+    expect(events[0].display).toEqual({ name: "Clock", activity: "Reading the clock" });
+  });
+
+  it("failure: receiving, then tool_failed — never 'saving'", async () => {
+    const owner = await user("lifecycle-failure");
+    const { run } = await setUpRun(owner);
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([toolCall(FIXTURE_TOOL_NAME, { timezone: "UTC", simulateFailure: true })]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    const publish = vi.fn(async () => {});
+
+    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([fixtureTool]), publish);
+
+    const events = toolEventsOf(publish);
+    expect(events.map((e) => (e.type === "tool_progress" ? `progress:${e.phase}` : e.type))).toEqual([
+      "tool_started",
+      "progress:receiving",
+      "tool_failed",
+    ]);
+    // A tool without its own display gets a neutral one derived from its name.
+    expect(events[0].display).toEqual({ name: "Get current time", activity: "Running get current time" });
+  });
+
+  it("a failing progress publish never affects the tool call or the run", async () => {
+    const owner = await user("lifecycle-publish-fails");
+    const { run } = await setUpRun(owner);
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([toolCall(FIXTURE_TOOL_NAME, { timezone: "UTC" })]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    const publish = vi.fn(async (event: { type: string }) => {
+      if (event.type === "tool_progress") throw new Error("metadata write failed");
+    });
+
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([fixtureTool]), publish as never);
+    expect(result.status).toBe("COMPLETED");
+    expect((await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } })).status).toBe("COMPLETED");
+  });
+});
+
 describe("executeAgentTurn — realtime publisher failure isolation", () => {
   it("a publisher that throws synchronously on every call never interrupts the run", async () => {
     const owner = await user("publisher-always-throws");

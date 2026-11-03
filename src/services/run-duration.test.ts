@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runDurationMs } from "./run-duration";
+import { runDurationMs, runQueueMs } from "./run-duration";
 import { MessageResponseSchema } from "@/contracts/message";
 
 const at = (iso: string) => new Date(iso);
@@ -55,5 +55,20 @@ describe("MessageResponseSchema.runDurationMs", () => {
   it("rejects a negative or fractional duration", () => {
     expect(MessageResponseSchema.safeParse({ ...base, runDurationMs: -1 }).success).toBe(false);
     expect(MessageResponseSchema.safeParse({ ...base, runDurationMs: 1.5 }).success).toBe(false);
+  });
+});
+
+describe("runQueueMs (admission → execution start)", () => {
+  const base = { createdAt: at("2026-11-04T10:00:00.000Z"), completedAt: null };
+  it("is the measured wait before Trigger.dev started the run, separate from execution", () => {
+    expect(runQueueMs({ ...base, status: "RUNNING", startedAt: at("2026-11-04T10:00:07.250Z") })).toBe(7_250);
+    expect(runQueueMs({ ...base, status: "COMPLETED", startedAt: at("2026-11-04T10:00:01Z"), completedAt: at("2026-11-04T10:05:00Z") })).toBe(1_000);
+  });
+  it("is null while still queued, and for missing, invalid or out-of-order timestamps", () => {
+    expect(runQueueMs({ ...base, status: "QUEUED", startedAt: null })).toBeNull();
+    expect(runQueueMs({ ...base, status: "FAILED", startedAt: null })).toBeNull(); // never started (e.g. cancelled while queued)
+    expect(runQueueMs({ ...base, status: "RUNNING", startedAt: new Date("nope") })).toBeNull();
+    expect(runQueueMs({ ...base, status: "RUNNING", startedAt: at("2026-11-04T09:59:59Z") })).toBeNull();
+    expect(runQueueMs(null)).toBeNull();
   });
 });

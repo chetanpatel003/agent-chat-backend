@@ -289,7 +289,15 @@ describe("listMessages — runDurationMs (measured, never estimated)", () => {
     const t0 = new Date("2026-11-04T10:00:00.000Z");
     const run = (status: "COMPLETED" | "RUNNING" | "FAILED", completedAt: Date | null) =>
       prisma.agentRun.create({
-        data: { chatId: chat.id, userId: owner.id, idempotencyKey: randomUUID(), status, createdAt: t0, completedAt },
+        data: {
+          chatId: chat.id,
+          userId: owner.id,
+          idempotencyKey: randomUUID(),
+          status,
+          createdAt: t0,
+          startedAt: new Date(t0.getTime() + 2_500), // 2.5 s queued before the worker picked it up
+          completedAt,
+        },
       });
     // A long Merge Videos turn: ~4 s thinking, minutes of tool work.
     const merged = await run("COMPLETED", new Date(t0.getTime() + 192_500));
@@ -308,6 +316,9 @@ describe("listMessages — runDurationMs (measured, never estimated)", () => {
     expect(userMsg.runDurationMs).toBeNull();
     expect(mergedMsg.runDurationMs).toBe(192_500);
     expect(mergedMsg.thinkingMs).toBe(4_000); // model time stays separate
+    expect(mergedMsg.runQueueMs).toBe(2_500); // queue time, measured separately
+    expect(activeMsg.runQueueMs).toBe(2_500);
+    expect(userMsg.runQueueMs).toBeNull();
     expect(activeMsg.runDurationMs).toBeNull();
     expect(recoveredMsg.runDurationMs).toBeNull();
   });
@@ -340,5 +351,24 @@ describe("listMessages — PENDING message of an ended run", () => {
     const [first, second] = (await listMessages(owner.id, chat.id, { limit: 10 })).items;
     expect(first).toMatchObject({ status: "PENDING", error: { code: "RUN_INTERRUPTED" } });
     expect(second).toMatchObject({ status: "PENDING", error: null });
+  });
+});
+
+describe("listMessages — tool display names", () => {
+  it("adds each tool_use block's user-facing name on read (persisted content unchanged)", async () => {
+    const owner = await user("msg-tool-display");
+    const chat = await prisma.chat.create({ data: { userId: owner.id } });
+    const id = randomUUID();
+    const content = [
+      { type: "tool_use", toolInvocationId: id, toolName: "merge_videos", status: "COMPLETED", input: {} },
+      { type: "tool_use", toolInvocationId: randomUUID(), toolName: "some_future_tool", status: "COMPLETED", input: {} },
+    ];
+    const created = await prisma.message.create({ data: { chatId: chat.id, userId: owner.id, role: "ASSISTANT", content } });
+
+    const [message] = (await listMessages(owner.id, chat.id, { limit: 10 })).items;
+    const uses = message.content.filter((b) => b.type === "tool_use");
+    expect(uses.map((b) => b.type === "tool_use" && b.displayName)).toEqual(["Merge Videos", "Some future tool"]);
+    const stored = await prisma.message.findUniqueOrThrow({ where: { id: created.id } });
+    expect(JSON.stringify(stored.content)).not.toContain("displayName");
   });
 });

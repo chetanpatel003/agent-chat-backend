@@ -12,7 +12,8 @@ import { sanitizeAssistantText } from "@/contracts/assistant-text";
 import type { Attachment, Message, Prisma } from "@/generated/prisma/client";
 import type { AgentRunStatus } from "@/generated/prisma/enums";
 import { ACTIVE_RUN_STATUSES } from "@/services/run-transitions";
-import { runDurationMs } from "@/services/run-duration";
+import { runDurationMs, runQueueMs } from "@/services/run-duration";
+import { toolDisplay } from "@/tools/display";
 
 /** `ownerUserId` is the authenticated caller, already verified as the chat's owner. */
 type MessageRow = Message & {
@@ -25,6 +26,7 @@ type MessageRow = Message & {
     errorCode: string | null;
     errorMessage: string | null;
     createdAt: Date;
+    startedAt: Date | null;
     completedAt: Date | null;
   } | null;
 };
@@ -103,6 +105,7 @@ async function toMessageResponse(message: MessageRow, ownerUserId: string, settl
       .filter((block) => block.type !== "thinking" && block.type !== "reasoning")
       .map((block) => {
         if (message.role !== "ASSISTANT") return block;
+        if (block.type === "tool_use") return { ...block, displayName: toolDisplay(block.toolName).name };
         if (block.type === "text") return { ...block, text: sanitizeAssistantText(block.text) };
         if (block.type === "tool_result" && block.creditsCharged === null) {
           // Only the invocation that belongs to this very message.
@@ -114,6 +117,7 @@ async function toMessageResponse(message: MessageRow, ownerUserId: string, settl
     attachments: await Promise.all(attachmentsOf(message).map((a) => toAttachmentResponse(a, ownerUserId))),
     thinkingMs: message.thinkingMs,
     runDurationMs: message.role === "ASSISTANT" ? runDurationMs(message.agentRun, message.status) : null,
+    runQueueMs: message.role === "ASSISTANT" ? runQueueMs(message.agentRun) : null,
     error: messageError(message),
     createdAt: message.createdAt.toISOString(),
   };
@@ -156,7 +160,7 @@ export async function listMessages(
     include: {
       attachments: { orderBy: { order: "asc" } },
       sentAttachments: { orderBy: { order: "asc" }, include: { attachment: true } },
-      agentRun: { select: { status: true, errorCode: true, errorMessage: true, createdAt: true, completedAt: true } },
+      agentRun: { select: { status: true, errorCode: true, errorMessage: true, createdAt: true, startedAt: true, completedAt: true } },
     },
   });
 

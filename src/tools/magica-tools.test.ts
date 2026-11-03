@@ -250,14 +250,21 @@ describe("generate_image — through the real agent loop", { timeout: AGENT_LOOP
       events.push(e);
     });
 
-    const toolEvents = events.filter((e) => e.type.startsWith("tool_")).map((e) => e.type);
-    expect(toolEvents).toEqual(["tool_started", "tool_progress", "tool_completed"]);
-    const progress = events.find((e) => e.type === "tool_progress");
-    expect(progress).toMatchObject({ toolName: "generate_image", phase: "provider_waiting" });
-    // Emitted with a seq between start and completion, so the UI can order it.
-    const seqOf = (type: string) => events.find((e) => e.type === type)?.seq ?? -1;
-    expect(seqOf("tool_started")).toBeLessThan(seqOf("tool_progress"));
-    expect(seqOf("tool_progress")).toBeLessThan(seqOf("tool_completed"));
+    const toolEvents = events.filter((e) => e.type.startsWith("tool_"));
+    // Generic lifecycle: calling (started, with the tool's display) → Magica's
+    // activity once the job is accepted → receiving → saving → completed.
+    expect(toolEvents.map((e) => (e.type === "tool_progress" ? `progress:${e.phase}` : e.type))).toEqual([
+      "tool_started",
+      "progress:provider_waiting",
+      "progress:receiving",
+      "progress:saving",
+      "tool_completed",
+    ]);
+    expect(toolEvents[0]).toMatchObject({ display: { name: "GPT Image 2", activity: "Generating image with Magica" } });
+    expect(toolEvents.filter((e) => e.type === "tool_progress" && e.phase === "provider_waiting")).toHaveLength(1);
+    // Each emitted with a seq between start and completion, so the UI can order them.
+    const seqs = toolEvents.map((e) => e.seq);
+    expect([...seqs].sort((a, b) => a - b)).toEqual(seqs);
   });
 
   it("does not report provider_waiting when the start itself fails", async () => {
@@ -272,7 +279,7 @@ describe("generate_image — through the real agent loop", { timeout: AGENT_LOOP
     await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([generateImageTool]), (e) => {
       events.push(e);
     });
-    expect(events.some((e) => e.type === "tool_progress")).toBe(false);
+    expect(events.some((e) => e.type === "tool_progress" && e.phase === "provider_waiting")).toBe(false);
     expect(mockStartMagicaRun).toHaveBeenCalledTimes(1);
   });
 

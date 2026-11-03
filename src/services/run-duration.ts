@@ -5,7 +5,27 @@ export type RunTiming = {
   status: AgentRunStatus;
   createdAt: Date | null;
   completedAt: Date | null;
+  /** When execution first started (Trigger.dev picked the run up). */
+  startedAt?: Date | null;
 };
+
+function validTime(date: Date | null | undefined): number | null {
+  const t = date?.getTime();
+  return t === undefined || !Number.isFinite(t) ? null : t;
+}
+
+/**
+ * Queue time: run admission (`createdAt`) → execution start (`startedAt`).
+ * Null while still queued, or when a timestamp is missing, invalid or out of
+ * order — never estimated.
+ */
+export function runQueueMs(run: RunTiming | null): number | null {
+  if (!run || run.status === "QUEUED") return null;
+  const start = validTime(run.createdAt);
+  const began = validTime(run.startedAt);
+  if (start === null || began === null || began < start) return null;
+  return began - start;
+}
 
 /**
  * A finished turn's measured wall-clock duration: from the run's admission

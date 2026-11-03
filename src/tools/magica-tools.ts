@@ -12,6 +12,8 @@ import {
 import { MagicaAmbiguousError, startMagicaRun } from "@/providers/magica";
 import { prisma } from "@/lib/prisma";
 import { extractMagicaMediaUrls } from "./magica-output";
+import { toolDisplay } from "./display";
+import type { ToolDisplay } from "@/contracts/run-event";
 import { admitBillableRun, type AdmissionSpec } from "@/services/credit-admission";
 import { mergeAdmissionCredits, resolveMergeSources } from "@/services/merge-admission";
 import { persistProviderRunId, pollMagicaRunToCompletion, reconcileMagicaRun, durableWait, type DurableWait } from "@/services/magica-run";
@@ -99,6 +101,7 @@ async function assertNoUnknownOutcome(toolName: string, context: ToolExecutionCo
 export function createMagicaTool<TInput>(options: {
   name: string;
   description: string;
+  display?: ToolDisplay;
   nodeType: string;
   subModelId?: string;
   inputSchema: z.ZodType<TInput>;
@@ -107,10 +110,11 @@ export function createMagicaTool<TInput>(options: {
   admission: (input: TInput, context: ToolExecutionContext) => AdmissionSpec | Promise<AdmissionSpec>;
   waitFn?: DurableWait;
 }): ToolDefinition<TInput, MagicaToolOutput> {
-  const { name, description, nodeType, subModelId, inputSchema, admission, waitFn = durableWait } = options;
+  const { name, description, display, nodeType, subModelId, inputSchema, admission, waitFn = durableWait } = options;
   return {
     name,
     description,
+    display: toolDisplay(name, display),
     inputSchema,
     outputSchema: MagicaToolOutputSchema,
     async execute(input, context) {

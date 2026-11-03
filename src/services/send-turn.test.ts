@@ -6,7 +6,9 @@
 // Everything that doesn't need a real dispatch (idempotency, conflict,
 // ownership) lives in send-turn.transactional.test.ts instead, mocked —
 // see that file's header for why splitting this out mattered in practice.
-import { describe, it, expect, afterAll } from "vitest";
+import { describe, it, expect, afterAll, vi } from "vitest";
+// Title generation is dispatched after every first message; never let a test reach Trigger.dev through it.
+vi.mock("@/trigger/generate-chat-title", () => ({ dispatchChatTitle: vi.fn().mockResolvedValue(true) }));
 import { randomUUID } from "node:crypto";
 import { prisma } from "@/lib/prisma";
 import { makeTestUser, cleanupTestUsers } from "@/test-utils/db-fixtures";

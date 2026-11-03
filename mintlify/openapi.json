@@ -2220,7 +2220,7 @@
           "Conversations"
         ],
         "summary": "Submit message (starts a run)",
-        "description": "Admits the message and dispatches a durable agent run. `attachmentIds` mixes new uploads and media-library items, in order. `interruptRunId` cancels the active run atomically. One active run per chat (409 otherwise).",
+        "description": "Admits the message and dispatches a durable agent run. `attachmentIds` mixes new uploads and media-library items, in order. `interruptRunId` cancels the active run atomically. One active run per chat (409 otherwise). The first message of an untitled chat also starts automatic title generation (asynchronous; never overwrites a title set via PATCH).",
         "parameters": [
           {
             "name": "chatId",

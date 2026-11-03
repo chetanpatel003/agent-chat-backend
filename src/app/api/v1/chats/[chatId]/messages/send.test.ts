@@ -21,6 +21,8 @@ vi.mock("@/trigger/run-agent-turn", () => ({
   runAgentTurn: { trigger: vi.fn(() => Promise.resolve({ id: `run_mocked_${randomUUID()}` })) },
 }));
 
+// Title generation is dispatched after every first message; never let a test reach Trigger.dev through it.
+vi.mock("@/trigger/generate-chat-title", () => ({ dispatchChatTitle: vi.fn().mockResolvedValue(true) }));
 import { verifyToken } from "@clerk/backend";
 import { clerkClient } from "@/lib/clerk";
 import { POST } from "./route";

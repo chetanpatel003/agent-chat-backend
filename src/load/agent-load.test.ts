@@ -30,6 +30,8 @@ const LEVELS = (process.env.LOAD_LEVELS ?? "10,25,50").split(",").map(Number);
 const createdUserIds: string[] = [];
 afterAll(() => cleanupTestUsers(createdUserIds));
 
+// Title generation is dispatched after every first message; never let a test reach Trigger.dev through it.
+vi.mock("@/trigger/generate-chat-title", () => ({ dispatchChatTitle: vi.fn().mockResolvedValue(true) }));
 const runtime: TurnRuntime = {
   openTextStream: () => ({ write: () => {}, close: async () => {} }),
   waitpoints: { createToken: () => Promise.reject(new Error("unused")), forToken: () => Promise.reject(new Error("unused")) },

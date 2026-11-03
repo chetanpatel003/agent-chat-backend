@@ -167,3 +167,20 @@ unknown outcome), H2 (recovered results attached to their message; message COMPL
 canonical output rule; no-media completions fail visibly), M3 (archived B2 copies preferred), L1
 (orphan close-out in the billable sweep). Open: M4 (live verification of edit/crop/merge), L2.
 Contract: `AttachmentResponse.toolInvocationId` (optional, additive). No migration.
+
+
+## Automatic chat titles (2026-11-04)
+- `services/chat-title.ts`: one OpenRouter Free request (existing adapter, free route only, no
+  tools) → cleaned/validated title (≤ 6 words, ≤ 50 chars, no URLs); any failure or junk → a
+  deterministic title from the message (leading filler dropped). Written only while `title IS NULL`
+  (`updateMany where title null`), so manual renames and earlier titles always win. Never charged.
+- `trigger/generate-chat-title.ts`: task `generate-chat-title`, idempotency key `chat-title:{chatId}`,
+  dispatched best-effort from `sendTurn` — scheduled with Next.js `after()` (`lib/after-response.ts`)
+  so it runs **after the HTTP response is sent**; the send path itself makes no title query or
+  dispatch — only when the chat is
+  untitled and this is its first user message (direct tool runs skipped). Existing chats with
+  history are never renamed. No migration.
+- Frontend: untitled chats show "New chat"; the chat list refreshes when the reply lands and when the
+  run ends, so the title appears in the sidebar.
+- Rename UI not added (API + `useUpdateChatTitle` already exist). Deployed backend unchanged until
+  merged and redeployed; the task registers on the next worker build.

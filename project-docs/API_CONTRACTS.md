@@ -1031,6 +1031,9 @@ Authoritative detail: `magica/CREDIT_ACCOUNTING.md`; decision 0014.
   new tool error codes (via `ToolExecutionError`) —
   `INSUFFICIENT_CREDITS`, `CREDIT_ESTIMATE_UNAVAILABLE` (estimate failed;
   fail closed), `EXPLICIT_SIZE_REQUIRED` (GPT Image 2 size Auto/omitted),
+  Provider outcomes (decision 0019): `PROVIDER_OUTCOME_UNKNOWN` (ambiguous start / untracked run —
+  never retried), `PROVIDER_RETRY_BLOCKED` (same tool again in that run), `PROVIDER_OUTPUT_INVALID`
+  (completed without valid media).
   Merge Videos: `MERGE_SOURCE_UNSUPPORTED`, `MERGE_DURATION_UNKNOWN`,
   `MERGE_DURATION_LIMIT` (decision 0018; formerly `ADMISSION_POLICY_REQUIRED`). Crop uses a fixed 5,000; GPT
   Image 2 uses `POST /v1/nodes/estimate-credits`, never `/pricing` tiers.

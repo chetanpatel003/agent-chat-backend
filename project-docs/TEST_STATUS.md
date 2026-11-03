@@ -504,3 +504,15 @@ Update this table (don't narrate) after each phase's test step.
 - `credit-admission.test.ts`: the merge case expects `MERGE_SOURCE_UNSUPPORTED` instead of the retired
   `ADMISSION_POLICY_REQUIRED`. `magica-tools.test.ts`: mocks `resolveMergeSources` (execution-only tests).
 - Live: one approved Transloadit upload (not a test file) — see `project-docs/magica/LIVE_VERIFICATION.md`.
+
+
+## Magica reliability fixes (2026-11-03) — mocked providers only
+- `src/services/magica-reliability.test.ts` (new, 18): H1 same/different arguments after an
+  ambiguous start, scope (other tool / later direct run allowed); M1 crop `image_url`/`result`/`images`,
+  merge/edit rule; M2 five invalid-output shapes (FAILED, visible, usage settled); H2 recovery into the
+  right message (COMPLETE, blocks in order, other messages untouched), concurrent sweeps + settlement
+  (one ledger row, one tool_result), failed and invalid recoveries; L1 orphan closed (no reconcile,
+  start or charge; idempotent) and left alone while its run is active. Mutations (no guard / no
+  attach / no M2 check) fail 2 / 4 / 5 of them.
+- `magica-tools.test.ts`: two expectations changed by design (no-media completion is now
+  `PROVIDER_OUTPUT_INVALID`; 202-then-persistence-failure is now `PROVIDER_OUTCOME_UNKNOWN`).

@@ -3,7 +3,7 @@ import { MagicaPollInconclusiveError } from "@/providers/magica";
 import { BILLABLE_TOOL_NAMES } from "@/services/credit-settlement";
 import { persistReconciledOutcome } from "@/services/tool-reconciliation";
 import { PRODUCTION_TOOL_REGISTRY } from "@/tools/registry";
-import type { ToolRegistry } from "@/tools/types";
+import { PROVIDER_OUTCOME_UNKNOWN, type ToolRegistry } from "@/tools/types";
 
 // Bounded recovery sweep for billable (Magica) tool invocations, run on a
 // schedule. Never starts a provider run: stale RUNNING invocations are
@@ -35,6 +35,16 @@ export type RecoverySummary = {
   reconcileFailed: number;
   settlementDispatched: number;
   settlementDispatchFailed: number;
+  /** L1: RUNNING invocations with no provider run id, whose run has ended, closed as outcome-unknown. */
+  orphansClosed: number;
+};
+
+/** What an orphan is closed with: the provider may or may not have run; nothing is invented or charged. */
+export const ORPHAN_OUTCOME = {
+  status: "failed" as const,
+  errorCode: PROVIDER_OUTCOME_UNKNOWN,
+  errorMessage:
+    "This request was interrupted before its provider run could be recorded, so its outcome is unknown. It was not charged; ask again if you still need it.",
 };
 
 /** One key per invocation per sweep window: concurrent sweeps dedupe, a later
@@ -51,6 +61,7 @@ export async function sweepBillableInvocations(deps: RecoveryDeps, now = new Dat
     reconcileFailed: 0,
     settlementDispatched: 0,
     settlementDispatchFailed: 0,
+    orphansClosed: 0,
   };
   const dispatch = async (id: string) => {
     const ok = await deps.dispatchSettlement(id, sweepSettlementKey(id, now));
@@ -112,6 +123,26 @@ export async function sweepBillableInvocations(deps: RecoveryDeps, now = new Dat
     select: { id: true },
   });
   for (const { id } of unsettled) await dispatch(id);
+
+  // 3. Orphans: RUNNING with no persisted provider run, untouched, and their run
+  // has ended — nothing can ever reconcile them (there is no run id to ask
+  // about, and a new run must never be started). Closed as outcome-unknown,
+  // with no usage recorded, so settlement never charges them.
+  const orphans = await prisma.toolInvocation.findMany({
+    where: {
+      status: "RUNNING",
+      providerRunId: null,
+      toolName: { in: [...BILLABLE_TOOL_NAMES] },
+      updatedAt: { lt: staleBefore },
+      agentRun: { status: { notIn: ["QUEUED", "RUNNING", "WAITING"] }, updatedAt: { lt: staleBefore } },
+    },
+    orderBy: { updatedAt: "asc" },
+    take: RECOVERY_BATCH_SIZE,
+    select: { id: true },
+  });
+  for (const { id } of orphans) {
+    if (await persistReconciledOutcome(id, ORPHAN_OUTCOME)) summary.orphansClosed++;
+  }
 
   return summary;
 }

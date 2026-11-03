@@ -51,7 +51,7 @@ import { archiveRunGeneratedAssets, isGeneratedMediaTool } from "@/services/gene
 import { dispatchGeneratedAssetArchival } from "./archive-generated-assets";
 import { isBillableTool, settleRunCredits, settleToolInvocationCreditsSafely } from "@/services/credit-settlement";
 import { dispatchCreditSettlement } from "./settle-tool-credits";
-import { persistReconciledOutcome } from "@/services/tool-reconciliation";
+import { attachRecoveredToolResult, persistReconciledOutcome } from "@/services/tool-reconciliation";
 
 export type RunAgentTurnPayload = {
   agentRunId: string;
@@ -496,7 +496,8 @@ async function runOneToolCall(params: {
     outcome = {
       ok: false,
       // A coded tool error (e.g. INSUFFICIENT_CREDITS) keeps its code; anything else is EXECUTION_FAILED as before.
-      errorCode: error instanceof ToolExecutionError ? error.code : "EXECUTION_FAILED",
+      errorCode:
+        error instanceof ToolExecutionError || error instanceof ProviderRunFailedError ? error.code : "EXECUTION_FAILED",
       errorMessage: error instanceof Error ? error.message : "Tool execution failed",
       creditUsed: error instanceof ProviderRunFailedError ? error.creditUsed : undefined,
     };
@@ -740,7 +741,17 @@ async function runAgentTurnOnce(
     // just reconciled) from their stored output — never a new Magica run.
     await archiveRunGeneratedAssets(run.id);
     await settleRunCredits(run.id);
-    return ambiguousOutcome(run.id, emit);
+    const ended = await ambiguousOutcome(run.id, emit);
+    // The reconciled result was added to the message while the run was still
+    // active; now that it has ended, a recovered success is shown as a result.
+    await attachRecoveredToolResult(staleToolInvocation.id).catch((error: unknown) => {
+      console.error("Could not finalise the recovered tool result", {
+        agentRunId: run.id,
+        toolInvocationId: staleToolInvocation.id,
+        error: error instanceof Error ? error.name : "UnknownError",
+      });
+    });
+    return ended;
   }
 
   // Re-entry ambiguous-outcome detection. A PENDING assistant message

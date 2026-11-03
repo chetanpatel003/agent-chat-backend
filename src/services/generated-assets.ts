@@ -1,3 +1,4 @@
+import { extractMagicaMediaUrls } from "@/tools/magica-output";
 import { prisma } from "@/lib/prisma";
 import { generatedObjectKey, openSourceStream, putObjectStream, SourceFetchError, StorageConfigError } from "@/lib/b2";
 import type { Attachment, Prisma } from "@/generated/prisma/client";
@@ -31,41 +32,22 @@ function strings(value: unknown): string[] | null {
   return Array.isArray(value) && value.length > 0 && value.every((v) => typeof v === "string") ? value : null;
 }
 
-function single(value: unknown): string[] | null {
-  return typeof value === "string" && value.length > 0 ? [value] : null;
-}
-
 /**
- * Tool-specific extraction from the persisted output `{ raw, images? }`.
- * generate_image: `raw.result[]` (live-verified). edit_image: same Magica
- * node, same shape (not live-run). crop_image / merge_videos: the
- * assessment-documented `image_url` / `video_url` (not live-run), or a
- * `result[]` if that is what arrives. Anything else yields nothing.
+ * Media to archive from a persisted output `{ raw, images? }`: the
+ * canonical `images` written at completion (tools/magica-output.ts), or —
+ * for rows persisted before that existed — the same canonical extraction
+ * applied to `raw`. One rule for persistence, archival and the chat UI.
  */
 export function extractGeneratedOutputs(toolName: string, output: unknown): GeneratedOutputs | null {
   const o = record(output);
-  if (!o) return null;
-  const raw = record(o.raw);
-  let family: MediaFamily;
-  let urls: string[] | null;
-  switch (toolName) {
-    case "generate_image":
-    case "edit_image":
-      family = "image";
-      urls = strings(o.images) ?? strings(raw?.result);
-      break;
-    case "crop_image":
-      family = "image";
-      urls = single(raw?.image_url) ?? strings(o.images) ?? strings(raw?.result);
-      break;
-    case "merge_videos":
-      family = "video";
-      urls = single(raw?.video_url) ?? strings(o.images) ?? strings(raw?.result);
-      break;
-    default:
-      return null;
-  }
+  if (!o || !GENERATED_MEDIA_TOOLS.has(toolName)) return null;
+  const family: MediaFamily = toolName === "merge_videos" ? "video" : "image";
+  const urls = strings(o.images) ?? nonEmpty(extractMagicaMediaUrls(toolName, o.raw));
   return urls ? { family, urls: urls.slice(0, MAX_OUTPUTS_PER_INVOCATION) } : null;
+}
+
+function nonEmpty(urls: string[]): string[] | null {
+  return urls.length > 0 ? urls : null;
 }
 
 /** Width/height for output `index` from Magica's `resultMetadata`, when present and sane. */

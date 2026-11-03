@@ -116,6 +116,7 @@ export async function toAttachmentResponse(attachment: Attachment, ownerUserId: 
     url: await deliveryUrl(attachment, ownerUserId),
     metadata: AttachmentMetadataSchema.parse(attachment.sanitizedMetadata ?? {}),
     order: attachment.order,
+    toolInvocationId: attachment.toolInvocationId,
     createdAt: attachment.createdAt.toISOString(),
   };
 }

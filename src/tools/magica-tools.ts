@@ -1,6 +1,17 @@
 import { z } from "zod";
-import { ProviderRunFailedError, type ToolDefinition, type ToolExecutionContext } from "./types";
-import { startMagicaRun } from "@/providers/magica";
+import {
+  PROVIDER_OUTCOME_UNKNOWN,
+  PROVIDER_OUTPUT_INVALID,
+  PROVIDER_RETRY_BLOCKED,
+  ProviderOutcomeUnknownError,
+  ProviderRunFailedError,
+  ToolExecutionError,
+  type ToolDefinition,
+  type ToolExecutionContext,
+} from "./types";
+import { MagicaAmbiguousError, startMagicaRun } from "@/providers/magica";
+import { prisma } from "@/lib/prisma";
+import { extractMagicaMediaUrls } from "./magica-output";
 import { admitBillableRun, type AdmissionSpec } from "@/services/credit-admission";
 import { mergeAdmissionCredits, resolveMergeSources } from "@/services/merge-admission";
 import { persistProviderRunId, pollMagicaRunToCompletion, reconcileMagicaRun, durableWait, type DurableWait } from "@/services/magica-run";
@@ -35,11 +46,10 @@ import { persistProviderRunId, pollMagicaRunToCompletion, reconcileMagicaRun, du
 // `{ images: [...] }`; the real, live gpt-image-2-text response was
 // actually `{ result: [...], provider: "fal", creditUsed,
 // resultMetadata: [...] }` — a completely different field name.
-// `extractImageUrls` checks both: `result` because it's now
-// confirmed real for this model, `images` because it remains the one
-// documented (if unverified-for-this-model) shape another Magica node
-// might use. Always preserves the complete raw output regardless of
-// which, or neither, matches.
+// The per-tool field rules now live in one place, `extractMagicaMediaUrls`
+// (tools/magica-output.ts), shared with archival and — via the persisted
+// `images` — the chat UI. The complete raw output is always preserved; a
+// completed run with no valid media is a PROVIDER_OUTPUT_INVALID failure.
 export const MagicaToolOutputSchema = z.object({
   raw: z.unknown(),
   images: z.array(z.string()).optional(),
@@ -52,26 +62,36 @@ export const MagicaToolOutputSchema = z.object({
 });
 export type MagicaToolOutput = z.infer<typeof MagicaToolOutputSchema>;
 
-function stringArrayField(output: unknown, field: string): string[] | undefined {
-  if (!output || typeof output !== "object" || !(field in output)) return undefined;
-  const value = (output as Record<string, unknown>)[field];
-  if (Array.isArray(value) && value.length > 0 && value.every((i) => typeof i === "string")) {
-    return value as string[];
-  }
-  return undefined;
-}
-
-function extractImageUrls(output: unknown): string[] | undefined {
-  return stringArrayField(output, "result") ?? stringArrayField(output, "images");
-}
-
-function normalizeMagicaOutput(rawOutput: unknown, creditUsed: number | undefined): MagicaToolOutput {
-  const images = extractImageUrls(rawOutput);
+/** Persisted shape: the complete raw output plus the canonical media URLs (`images`, for videos too). */
+function normalizeMagicaOutput(toolName: string, rawOutput: unknown, creditUsed: number | undefined): MagicaToolOutput {
+  const images = extractMagicaMediaUrls(toolName, rawOutput);
   return {
     raw: rawOutput,
-    ...(images ? { images } : {}),
+    ...(images.length > 0 ? { images } : {}),
     ...(creditUsed !== undefined ? { creditUsed } : {}),
   };
+}
+
+const outputInvalidMessage = (toolName: string) =>
+  `The ${toolName} run finished, but the provider returned no usable media. Nothing was shown; the user can try again.`;
+
+/**
+ * H1: an earlier call to this tool in the same AgentRun ended with an
+ * unknown provider outcome — a further call (any arguments) could start a
+ * second paid run, so it is refused before admission or any provider call.
+ */
+async function assertNoUnknownOutcome(toolName: string, context: ToolExecutionContext): Promise<void> {
+  const earlier = await prisma.toolInvocation.findFirst({
+    where: { agentRunId: context.agentRunId, toolName, errorCode: PROVIDER_OUTCOME_UNKNOWN, id: { not: context.invocationId } },
+    select: { id: true },
+  });
+  if (earlier) {
+    throw new ToolExecutionError(
+      PROVIDER_RETRY_BLOCKED,
+      `${toolName} was not run: an earlier ${toolName} request in this turn may still be running at the provider. ` +
+        `Do not call ${toolName} again in this turn; tell the user the result may still arrive.`,
+    );
+  }
 }
 
 // ---------- Shared factory ----------
@@ -94,9 +114,18 @@ export function createMagicaTool<TInput>(options: {
     inputSchema,
     outputSchema: MagicaToolOutputSchema,
     async execute(input, context) {
+      await assertNoUnknownOutcome(name, context);
       // Before any provider call: refuses (coded error) rather than start an unaffordable or unpriced run.
       await admitBillableRun(context.userId, await admission(input, context));
-      const started = await startMagicaRun(nodeType, input as Record<string, unknown>, subModelId);
+      let started;
+      try {
+        started = await startMagicaRun(nodeType, input as Record<string, unknown>, subModelId);
+      } catch (error) {
+        // Ambiguous (network/timeout/5xx): the run may exist. Recorded as an
+        // unknown outcome — never resubmitted, and further calls are blocked.
+        if (error instanceof MagicaAmbiguousError) throw new ProviderOutcomeUnknownError(name, error.code);
+        throw error;
+      }
 
       // Persisted immediately after the 202, before any poll/wait —
       // checkpoint 3.2's own requirement. A failure to apply this
@@ -104,9 +133,11 @@ export function createMagicaTool<TInput>(options: {
       // can no longer track; never start a second one because of it.
       const persisted = await persistProviderRunId(context.invocationId, started.runId);
       if (!persisted.applied) {
-        throw new Error(
-          `Magica run ${started.runId} started but could not be durably recorded against invocation ${context.invocationId}`,
-        );
+        console.error("Magica run started but its id could not be recorded", {
+          invocationId: context.invocationId,
+          agentRunId: context.agentRunId,
+        });
+        throw new ProviderOutcomeUnknownError(name, "MAGICA_RUN_ID_NOT_PERSISTED");
       }
 
       // From here the job is Magica's: tell the UI we are waiting for it.
@@ -122,12 +153,27 @@ export function createMagicaTool<TInput>(options: {
         // Same message/semantics as before; also carries Magica's reported usage.
         throw new ProviderRunFailedError(outcome.errorMessage, outcome.creditUsed);
       }
-      return normalizeMagicaOutput(outcome.output, outcome.creditUsed);
+      const normalized = normalizeMagicaOutput(name, outcome.output, outcome.creditUsed);
+      // M2: "completed" without valid media is a failure the user can see — not
+      // an empty success. Magica's reported usage is kept, as for any failed run.
+      if (!normalized.images) {
+        throw new ProviderRunFailedError(outputInvalidMessage(name), outcome.creditUsed, PROVIDER_OUTPUT_INVALID);
+      }
+      return normalized;
     },
     async reconcile(invocation, options) {
       const outcome = await reconcileMagicaRun(invocation, waitFn, options);
       if (outcome.status === "completed") {
-        return { status: "completed" as const, output: normalizeMagicaOutput(outcome.output, outcome.creditUsed) };
+        const normalized = normalizeMagicaOutput(name, outcome.output, outcome.creditUsed);
+        if (!normalized.images) {
+          return {
+            status: "failed" as const,
+            errorCode: PROVIDER_OUTPUT_INVALID,
+            errorMessage: outputInvalidMessage(name),
+            ...(outcome.creditUsed !== undefined ? { creditUsed: outcome.creditUsed } : {}),
+          };
+        }
+        return { status: "completed" as const, output: normalized };
       }
       return outcome;
     },

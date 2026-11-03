@@ -8,6 +8,9 @@ description: What is not done, or not verified live.
   videos and external links are refused. Its admission estimate uses the measured upload durations
   and a 1.3× safety margin (decision 0018); the charge is always Magica's reported usage. No live
   merge has been run, so the pricing formula is documented but not confirmed against a real charge.
+- **Unknown provider outcomes**: if a Magica request's start can't be confirmed, it is never
+  retried in that turn (`PROVIDER_OUTCOME_UNKNOWN`); a result that finishes after its turn stopped
+  waiting is added to the chat by recovery, typically 15–25 minutes later.
 - **Authentication** uses Clerk session tokens; there are no long-lived API keys.
 - **Live verification**: `generate_image` was verified against Magica; `edit_image`, `crop_image`
   and `merge_videos` are verified with recorded fixtures only.

@@ -159,3 +159,11 @@ Decision 0018 accepted (D1 1.3×, D2 no live merge, D3 300 s cap, D4 one Translo
 - Tests: `merge-admission.test.ts` (19, DB-backed, Magica/OpenRouter mocked); `credit-admission.test.ts`
   merge case now expects `MERGE_SOURCE_UNSUPPORTED`; `magica-tools.test.ts` mocks the source lookup for
   its placeholder-URL execution tests.
+
+
+## Magica reliability fixes (2026-11-03) — decision 0019
+Audit saved as `project-docs/magica/AUDIT-2026-11-03.md`. Fixed H1 (no same-tool retry after an
+unknown outcome), H2 (recovered results attached to their message; message COMPLETE), M1/M2 (one
+canonical output rule; no-media completions fail visibly), M3 (archived B2 copies preferred), L1
+(orphan close-out in the billable sweep). Open: M4 (live verification of edit/crop/merge), L2.
+Contract: `AttachmentResponse.toolInvocationId` (optional, additive). No migration.

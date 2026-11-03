@@ -218,7 +218,7 @@ describe("generate_image — through the real agent loop", { timeout: AGENT_LOOP
     expect(invocation.output).toEqual({ raw: rawOutput, images: ["https://static.magica.com/real-example.png"], creditUsed: 8385 });
   });
 
-  it("preserves the complete raw output even when no images array is present, without inventing one", async () => {
+  it("a completed run with no recognisable media is a visible PROVIDER_OUTPUT_INVALID failure, never an empty success", async () => {
     const owner = await user("genimg-no-images-field");
     const { run } = await setUpRun(owner);
     const call = toolCall("generate_image", { prompt: "x" });
@@ -231,7 +231,10 @@ describe("generate_image — through the real agent loop", { timeout: AGENT_LOOP
     await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([generateImageTool]), noopPublish);
 
     const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
-    expect(invocation.output).toEqual({ raw: { somethingElse: true } });
+    // M2 (audit 2026-11-03): formerly persisted as COMPLETED `{ raw }` with nothing to show.
+    expect(invocation.status).toBe("FAILED");
+    expect(invocation.errorCode).toBe("PROVIDER_OUTPUT_INVALID");
+    expect(JSON.stringify(invocation.output ?? {})).not.toContain("images"); // nothing invented
   });
 
   it("reports provider_waiting once, after the provider accepted the job and before its result", async () => {
@@ -414,13 +417,12 @@ describe("generate_image — through the real agent loop", { timeout: AGENT_LOOP
     expect(mockStartMagicaRun).toHaveBeenCalledTimes(1); // never called a second time
     expect(mockGetMagicaRun).not.toHaveBeenCalled(); // never reaches polling
 
-    // execute() threw a plain Error (not MagicaPollInconclusiveError),
-    // so runOneToolCall's existing, already-established mechanism
-    // persists it as an ordinary tool-execution failure — the same
-    // outcome any other execute()-throws case gets.
+    // The run may exist at Magica but can't be tracked: recorded as an
+    // unknown provider outcome (H1), which also blocks further calls to
+    // this tool in the run — still never a second start.
     const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
     expect(invocation.status).toBe("FAILED");
-    expect(invocation.errorCode).toBe("EXECUTION_FAILED");
+    expect(invocation.errorCode).toBe("PROVIDER_OUTCOME_UNKNOWN");
     expect(invocation.providerRunId).toBeNull(); // the persistence write never landed
   });
 });

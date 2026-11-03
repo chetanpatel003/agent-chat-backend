@@ -39,16 +39,41 @@ export class ToolExecutionError extends Error {
   }
 }
 
-/** A provider run that ended FAILED/CANCELED. Same message and error
- * semantics as a plain failure; additionally carries the provider's
- * reported raw `creditUsed` so it can be persisted and settled. */
+/** A provider run that ended FAILED/CANCELED (or COMPLETED without usable
+ * output). Carries the provider's reported raw `creditUsed` so it can be
+ * persisted and settled, and the error code to record (EXECUTION_FAILED
+ * unless the cause is more specific). */
 export class ProviderRunFailedError extends Error {
   constructor(
     message: string,
     public readonly creditUsed: number | undefined,
+    public readonly code: string = "EXECUTION_FAILED",
   ) {
     super(message);
     this.name = "ProviderRunFailedError";
+  }
+}
+
+/** The provider may have started a billable run we cannot track (ambiguous
+ * start, or a 202 whose run id could not be persisted). Never retried. */
+export const PROVIDER_OUTCOME_UNKNOWN = "PROVIDER_OUTCOME_UNKNOWN";
+/** A further call to a tool whose earlier call in the same run had an unknown outcome. */
+export const PROVIDER_RETRY_BLOCKED = "PROVIDER_RETRY_BLOCKED";
+/** The provider reported success but returned no valid, recognised media. */
+export const PROVIDER_OUTPUT_INVALID = "PROVIDER_OUTPUT_INVALID";
+
+export class ProviderOutcomeUnknownError extends ToolExecutionError {
+  constructor(
+    toolName: string,
+    /** The adapter's own classification (e.g. MAGICA_START_AMBIGUOUS_5XX), for logs. */
+    public readonly providerCode: string,
+  ) {
+    super(
+      PROVIDER_OUTCOME_UNKNOWN,
+      `The ${toolName} request may already be running at the provider, but its outcome is unknown. ` +
+        `Do not call ${toolName} again in this turn; tell the user the result may still arrive and that they can ask again later.`,
+    );
+    this.name = "ProviderOutcomeUnknownError";
   }
 }
 

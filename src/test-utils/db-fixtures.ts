@@ -22,6 +22,8 @@ export async function makeTestUser(label: string) {
 export async function cleanupTestUsers(userIds: string[]) {
   if (!userIds.length) return;
   const where = { userId: { in: userIds } };
+  // Generated attachments reference ToolInvocation (RESTRICT): delete first.
+  await prisma.attachment.deleteMany({ where });
   await prisma.toolInvocation.deleteMany({
     where: { agentRun: { userId: { in: userIds } } },
   });
@@ -34,7 +36,21 @@ export async function cleanupTestUsers(userIds: string[]) {
   await prisma.agentRun.deleteMany({ where });
   await prisma.message.deleteMany({ where });
   await prisma.chat.deleteMany({ where });
+  await prisma.webhookEndpoint.deleteMany({ where });
   await prisma.creditLedger.deleteMany({ where });
   await prisma.creditAccount.deleteMany({ where });
   await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+}
+
+/**
+ * For fixtures that insert a user message's uploads directly: records the
+ * send associations `attachToMessage` would have created, one per upload
+ * whose origin is that message, in its stored order.
+ */
+export async function linkSentUploads(messageId: string) {
+  const uploads = await prisma.attachment.findMany({ where: { messageId, source: "UPLOAD" } });
+  await prisma.messageAttachment.createMany({
+    data: uploads.map((a) => ({ messageId, attachmentId: a.id, order: a.order })),
+    skipDuplicates: true,
+  });
 }

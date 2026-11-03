@@ -1,0 +1,49 @@
+---
+title: Quickstart
+description: Run the backend, frontend and worker locally.
+---
+
+Requirements: Node 22, pnpm, a Neon (or any PostgreSQL 18+ with `uuidv7()`) database, and free
+accounts for Clerk, Trigger.dev, OpenRouter, Transloadit (Community plan) and Backblaze B2.
+
+```sh
+# backend (http://localhost:3001)
+cd agent-chat-backend
+cp .env.example .env            # fill in values (see Deployment for every name)
+pnpm install
+pnpm prisma migrate deploy
+pnpm dev
+
+# durable worker (separate terminal) — runs agent turns and recovery sweeps
+pnpm trigger:dev
+
+# frontend (http://localhost:3000)
+cd ../agent-chat-frontend
+cp .env.example .env.local
+pnpm install && pnpm dev
+```
+
+## First request
+
+```sh
+curl -X POST http://localhost:3001/api/v1/completions \
+  -H "Authorization: Bearer $CLERK_SESSION_TOKEN" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Write a two-line poem about the sea."}'
+```
+
+```json
+{
+  "ok": true,
+  "data": {
+    "chatId": "01a1…",
+    "runId": "01a1…",
+    "messageId": "01a1…",
+    "status": "QUEUED",
+    "links": { "run": "/api/v1/chats/01a1…/runs/01a1…", "messages": "/api/v1/chats/01a1…/messages" }
+  }
+}
+```
+
+Poll `links.run` until `status` is `COMPLETED`, `FAILED` or `CANCELLED`, then read `links.messages`.

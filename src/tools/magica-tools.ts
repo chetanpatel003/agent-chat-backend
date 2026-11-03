@@ -1,6 +1,19 @@
 import { z } from "zod";
-import type { ToolDefinition } from "./types";
-import { startMagicaRun } from "@/providers/magica";
+import {
+  PROVIDER_OUTCOME_UNKNOWN,
+  PROVIDER_OUTPUT_INVALID,
+  PROVIDER_RETRY_BLOCKED,
+  ProviderOutcomeUnknownError,
+  ProviderRunFailedError,
+  ToolExecutionError,
+  type ToolDefinition,
+  type ToolExecutionContext,
+} from "./types";
+import { MagicaAmbiguousError, startMagicaRun } from "@/providers/magica";
+import { prisma } from "@/lib/prisma";
+import { extractMagicaMediaUrls } from "./magica-output";
+import { admitBillableRun, type AdmissionSpec } from "@/services/credit-admission";
+import { mergeAdmissionCredits, resolveMergeSources } from "@/services/merge-admission";
 import { persistProviderRunId, pollMagicaRunToCompletion, reconcileMagicaRun, durableWait, type DurableWait } from "@/services/magica-run";
 
 /**
@@ -33,11 +46,10 @@ import { persistProviderRunId, pollMagicaRunToCompletion, reconcileMagicaRun, du
 // `{ images: [...] }`; the real, live gpt-image-2-text response was
 // actually `{ result: [...], provider: "fal", creditUsed,
 // resultMetadata: [...] }` — a completely different field name.
-// `extractImageUrls` checks both: `result` because it's now
-// confirmed real for this model, `images` because it remains the one
-// documented (if unverified-for-this-model) shape another Magica node
-// might use. Always preserves the complete raw output regardless of
-// which, or neither, matches.
+// The per-tool field rules now live in one place, `extractMagicaMediaUrls`
+// (tools/magica-output.ts), shared with archival and — via the persisted
+// `images` — the chat UI. The complete raw output is always preserved; a
+// completed run with no valid media is a PROVIDER_OUTPUT_INVALID failure.
 export const MagicaToolOutputSchema = z.object({
   raw: z.unknown(),
   images: z.array(z.string()).optional(),
@@ -50,26 +62,36 @@ export const MagicaToolOutputSchema = z.object({
 });
 export type MagicaToolOutput = z.infer<typeof MagicaToolOutputSchema>;
 
-function stringArrayField(output: unknown, field: string): string[] | undefined {
-  if (!output || typeof output !== "object" || !(field in output)) return undefined;
-  const value = (output as Record<string, unknown>)[field];
-  if (Array.isArray(value) && value.length > 0 && value.every((i) => typeof i === "string")) {
-    return value as string[];
-  }
-  return undefined;
-}
-
-function extractImageUrls(output: unknown): string[] | undefined {
-  return stringArrayField(output, "result") ?? stringArrayField(output, "images");
-}
-
-function normalizeMagicaOutput(rawOutput: unknown, creditUsed: number | undefined): MagicaToolOutput {
-  const images = extractImageUrls(rawOutput);
+/** Persisted shape: the complete raw output plus the canonical media URLs (`images`, for videos too). */
+function normalizeMagicaOutput(toolName: string, rawOutput: unknown, creditUsed: number | undefined): MagicaToolOutput {
+  const images = extractMagicaMediaUrls(toolName, rawOutput);
   return {
     raw: rawOutput,
-    ...(images ? { images } : {}),
+    ...(images.length > 0 ? { images } : {}),
     ...(creditUsed !== undefined ? { creditUsed } : {}),
   };
+}
+
+const outputInvalidMessage = (toolName: string) =>
+  `The ${toolName} run finished, but the provider returned no usable media. Nothing was shown; the user can try again.`;
+
+/**
+ * H1: an earlier call to this tool in the same AgentRun ended with an
+ * unknown provider outcome — a further call (any arguments) could start a
+ * second paid run, so it is refused before admission or any provider call.
+ */
+async function assertNoUnknownOutcome(toolName: string, context: ToolExecutionContext): Promise<void> {
+  const earlier = await prisma.toolInvocation.findFirst({
+    where: { agentRunId: context.agentRunId, toolName, errorCode: PROVIDER_OUTCOME_UNKNOWN, id: { not: context.invocationId } },
+    select: { id: true },
+  });
+  if (earlier) {
+    throw new ToolExecutionError(
+      PROVIDER_RETRY_BLOCKED,
+      `${toolName} was not run: an earlier ${toolName} request in this turn may still be running at the provider. ` +
+        `Do not call ${toolName} again in this turn; tell the user the result may still arrive.`,
+    );
+  }
 }
 
 // ---------- Shared factory ----------
@@ -80,16 +102,30 @@ export function createMagicaTool<TInput>(options: {
   nodeType: string;
   subModelId?: string;
   inputSchema: z.ZodType<TInput>;
+  /** Required: every billable tool declares how its cost is checked before running. */
+  /** May look up the caller's own data (e.g. measured video durations); runs before any provider call. */
+  admission: (input: TInput, context: ToolExecutionContext) => AdmissionSpec | Promise<AdmissionSpec>;
   waitFn?: DurableWait;
 }): ToolDefinition<TInput, MagicaToolOutput> {
-  const { name, description, nodeType, subModelId, inputSchema, waitFn = durableWait } = options;
+  const { name, description, nodeType, subModelId, inputSchema, admission, waitFn = durableWait } = options;
   return {
     name,
     description,
     inputSchema,
     outputSchema: MagicaToolOutputSchema,
     async execute(input, context) {
-      const started = await startMagicaRun(nodeType, input as Record<string, unknown>, subModelId);
+      await assertNoUnknownOutcome(name, context);
+      // Before any provider call: refuses (coded error) rather than start an unaffordable or unpriced run.
+      await admitBillableRun(context.userId, await admission(input, context));
+      let started;
+      try {
+        started = await startMagicaRun(nodeType, input as Record<string, unknown>, subModelId);
+      } catch (error) {
+        // Ambiguous (network/timeout/5xx): the run may exist. Recorded as an
+        // unknown outcome — never resubmitted, and further calls are blocked.
+        if (error instanceof MagicaAmbiguousError) throw new ProviderOutcomeUnknownError(name, error.code);
+        throw error;
+      }
 
       // Persisted immediately after the 202, before any poll/wait —
       // checkpoint 3.2's own requirement. A failure to apply this
@@ -97,10 +133,16 @@ export function createMagicaTool<TInput>(options: {
       // can no longer track; never start a second one because of it.
       const persisted = await persistProviderRunId(context.invocationId, started.runId);
       if (!persisted.applied) {
-        throw new Error(
-          `Magica run ${started.runId} started but could not be durably recorded against invocation ${context.invocationId}`,
-        );
+        console.error("Magica run started but its id could not be recorded", {
+          invocationId: context.invocationId,
+          agentRunId: context.agentRunId,
+        });
+        throw new ProviderOutcomeUnknownError(name, "MAGICA_RUN_ID_NOT_PERSISTED");
       }
+
+      // From here the job is Magica's: tell the UI we are waiting for it.
+      // Best-effort: never let a progress report affect a started billable run.
+      await context.onProgress?.("provider_waiting").catch(() => undefined);
 
       const outcome = await pollMagicaRunToCompletion({
         agentRunId: context.agentRunId,
@@ -108,14 +150,30 @@ export function createMagicaTool<TInput>(options: {
         waitFn,
       });
       if (outcome.status === "failed") {
-        throw new Error(outcome.errorMessage);
+        // Same message/semantics as before; also carries Magica's reported usage.
+        throw new ProviderRunFailedError(outcome.errorMessage, outcome.creditUsed);
       }
-      return normalizeMagicaOutput(outcome.output, outcome.creditUsed);
+      const normalized = normalizeMagicaOutput(name, outcome.output, outcome.creditUsed);
+      // M2: "completed" without valid media is a failure the user can see — not
+      // an empty success. Magica's reported usage is kept, as for any failed run.
+      if (!normalized.images) {
+        throw new ProviderRunFailedError(outputInvalidMessage(name), outcome.creditUsed, PROVIDER_OUTPUT_INVALID);
+      }
+      return normalized;
     },
-    async reconcile(invocation) {
-      const outcome = await reconcileMagicaRun(invocation, waitFn);
+    async reconcile(invocation, options) {
+      const outcome = await reconcileMagicaRun(invocation, waitFn, options);
       if (outcome.status === "completed") {
-        return { status: "completed" as const, output: normalizeMagicaOutput(outcome.output, outcome.creditUsed) };
+        const normalized = normalizeMagicaOutput(name, outcome.output, outcome.creditUsed);
+        if (!normalized.images) {
+          return {
+            status: "failed" as const,
+            errorCode: PROVIDER_OUTPUT_INVALID,
+            errorMessage: outputInvalidMessage(name),
+            ...(outcome.creditUsed !== undefined ? { creditUsed: outcome.creditUsed } : {}),
+          };
+        }
+        return { status: "completed" as const, output: normalized };
       }
       return outcome;
     },
@@ -167,6 +225,34 @@ export const PublicHttpsUrlSchema = z
   .url()
   .refine((u) => u.startsWith("https://"), { message: "must be a public HTTPS URL" });
 
+// ---------- Admission policies (see project-docs/magica/CREDIT_ACCOUNTING.md) ----------
+
+/** Crop Image is a documented flat price; `/pricing` (fixed, 5000) and
+ * `estimate-credits` (5000) agree, so no estimate call is needed. */
+export const CROP_IMAGE_CREDITS = BigInt(5000);
+
+/** GPT Image 2: Magica's own estimate, only for an explicit size. Size
+ * "Auto" (or omitted, which defaults to Auto) is priced from the actual
+ * output and cannot be estimated, so it is refused with guidance. The
+ * estimate body mirrors the one previously verified to succeed; media
+ * (uploadedImages) is never sent — it does not affect GPT Image 2 pricing. */
+function gptImage2Admission(subModelId: string) {
+  return (input: { prompt: string; size?: unknown; quality?: string; n?: number }): AdmissionSpec => {
+    if (input.size === undefined || input.size === "Auto") {
+      return {
+        kind: "blocked",
+        code: "EXPLICIT_SIZE_REQUIRED",
+        message:
+          'The cost of size "Auto" cannot be estimated before running. Retry with an explicit size such as "1024x1024".',
+      };
+    }
+    const data: Record<string, unknown> = { prompt: input.prompt, size: input.size };
+    if (input.quality !== undefined) data.quality = input.quality;
+    if (input.n !== undefined) data.n = input.n;
+    return { kind: "estimate", node: { type: "gpt_image_2", subModelId, data } };
+  };
+}
+
 // ---------- generate_image (GPT Image 2, text-to-image) ----------
 
 const GenerateImageInputSchema = z.object({
@@ -182,6 +268,7 @@ export const generateImageTool: ToolDefinition<z.infer<typeof GenerateImageInput
     nodeType: "gpt_image_2",
     subModelId: "gpt-image-2-text",
     inputSchema: GenerateImageInputSchema,
+    admission: gptImage2Admission("gpt-image-2-text"),
   });
 
 // ---------- edit_image (GPT Image 2, image editing) ----------
@@ -207,6 +294,7 @@ export const editImageTool: ToolDefinition<z.infer<typeof EditImageInputSchema>,
     nodeType: "gpt_image_2",
     subModelId: "gpt-image-2-edit",
     inputSchema: EditImageInputSchema,
+    admission: gptImage2Admission("gpt-image-2-edit"),
   },
 );
 
@@ -235,6 +323,7 @@ export const cropImageTool: ToolDefinition<z.infer<typeof CropImageInputSchema>,
       "Crop an existing single image to a specific rectangular region, by percentage of the original or exact pixel coordinates — a purely geometric crop, no AI modification of pixel content.",
     nodeType: "crop_image",
     inputSchema: CropImageInputSchema,
+    admission: () => ({ kind: "fixed", credits: CROP_IMAGE_CREDITS }),
   },
 );
 
@@ -254,7 +343,15 @@ export const mergeVideosTool: ToolDefinition<z.infer<typeof MergeVideosInputSche
   createMagicaTool({
     name: "merge_videos",
     description:
-      "Combine 2 to 100 existing videos into a single video, in the given order, with an optional transition between clips.",
+      "Combine 2 to 100 of the user's own uploaded videos (5 minutes combined at most) into a single video, in the given order, with an optional transition between clips. Pass the video URLs exactly as listed under the user's attached files; generated videos and external links are not accepted.",
     nodeType: "merge_videos",
     inputSchema: MergeVideosInputSchema,
+    // Decision 0018: priced from the server-measured durations of the user's
+    // own uploads (no duration exists in Magica's input); settlement still
+    // charges Magica's reported creditUsed.
+    admission: async (input, context) => {
+      const sources = await resolveMergeSources(context.userId, input.video_urls);
+      const { required } = mergeAdmissionCredits(sources.videoCount, sources.totalSeconds);
+      return { kind: "fixed", credits: required };
+    },
   });

@@ -203,7 +203,7 @@ Pricing for both sub-models (identical to each other):
   "note": "Pass sampleInput to get an estimatedCost value. Credits are checked and charged automatically when you call execute_tool."
 }
 ```
-(`M` = million microcredits, i.e. divide by 1,000,000 for credits — `0.21072M` microcredits = `210.72` credits. Range across all tiers: **~4.71 credits** (`Low:2048x1152`) to **~428.16 credits** (`High:2048x2048`) per call.) Cost depends on `quality` + `size` only — not on `n` (number of images) per the documented `pricingInputs`, though this wasn't independently cross-checked against an actual charge (no run was executed). **Cost estimation is available**: pass `sampleInput` (a URL-encoded JSON object built from this schema) to this same `GET .../pricing` endpoint for an exact `estimatedCost`, or `POST /v1/nodes/estimate-credits` with `{type, data?, subModelId?}` for a batch estimate (documented, **not called** — see below).
+(`M` = ×1,000,000 raw integer units — the same unit as `estimate-credits` and `creditUsed`: `0.21072M` = 210,720 raw units, displayed "0.21M". Range across all tiers: **4,710** (`Low:2048x1152`) to **428,160** (`High:2048x2048`) raw units per call — note real charges are exactly 1.3× these tier values; see CREDIT_ACCOUNTING.md. *Corrected in checkpoint 5.1; this previously, wrongly, read "210.72 credits".*) Cost depends on `quality` + `size` only — not on `n` (number of images) per the documented `pricingInputs`, though this wasn't independently cross-checked against an actual charge (no run was executed). **Cost estimation is available**: pass `sampleInput` (a URL-encoded JSON object built from this schema) to this same `GET .../pricing` endpoint for an exact `estimatedCost`, or `POST /v1/nodes/estimate-credits` with `{type, data?, subModelId?}` for a batch estimate (documented, **not called** — see below).
 
 ---
 
@@ -274,7 +274,7 @@ rate as a planning-time approximation.
 | Media input | 1 image (URL) | none | up to 10 images (URL) | 2–100 videos (URL) |
 | Enums/selects | 0 (all sliders/numbers) | 4 (`size`, `quality`, `background`, `output_format`) + `n` | same 4 + `n` | 1 (`transition`) |
 | Pricing type | `fixed` | `tiered` (quality × size) | `tiered` (quality × size, identical table) | `per_minute` (+ per extra video) |
-| Pricing range | 5,000 credits (flat) | ~4.71–428.16 credits | ~4.71–428.16 credits | 40,000/min base + 10,000/min per extra video |
+| Pricing range (raw units) | 5,000 (flat) | 4,710–428,160 (tiers; real charge ×1.3) | 4,710–428,160 (tiers; real charge ×1.3) | 40,000/min base + 10,000/min per extra video |
 | Pricing accepts bare nodeType? | yes | **no** (sub-model required — see gap above) | yes (as its own subModelId) | yes |
 | Output contract documented? | no | no | no | no |
 

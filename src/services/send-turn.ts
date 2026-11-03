@@ -1,8 +1,11 @@
 import { prisma } from "@/lib/prisma";
 import { Prisma } from "@/generated/prisma/client";
-import { ConflictError } from "@/lib/errors";
+import { ConflictError, NotFoundError } from "@/lib/errors";
 import { requireChatOwnership } from "@/services/ownership";
+import { attachToMessage } from "@/services/attachment";
 import { runAgentTurn } from "@/trigger/run-agent-turn";
+import { cancelActiveRunInTx, cancelTriggerRunBestEffort, INTERRUPTED_BY_USER } from "@/services/agent-run";
+import { RUN_TRANSITION_TRANSACTION_OPTIONS } from "@/services/run-transitions";
 import type { SendMessageRequest, SendMessageResponse } from "@/contracts/message";
 
 // Verified empirically against the real DB — see decisions/0009. Prisma's
@@ -22,8 +25,17 @@ function violatedIndex(error: unknown): string | null {
   return meta?.driverAdapterError?.cause?.constraint?.index ?? null;
 }
 
-async function readExistingDispatch(idempotencyKey: string): Promise<SendMessageResponse> {
+async function readExistingDispatch(
+  userId: string,
+  chatId: string,
+  idempotencyKey: string,
+): Promise<SendMessageResponse> {
   const run = await prisma.agentRun.findUniqueOrThrow({ where: { idempotencyKey } });
+  // Keys are global: a key already used by someone else (or for another
+  // chat) is a conflict, never a way to read that dispatch.
+  if (run.userId !== userId || run.chatId !== chatId) {
+    throw new ConflictError("This Idempotency-Key was already used for a different request");
+  }
   // The user Message that triggered this run carries the same
   // agentRunId — a deliberate reuse of that column for the user's own
   // message, not just assistant/tool output (see PHASE2-PLAN.md §3 and
@@ -52,16 +64,35 @@ export async function sendTurn(
   userId: string,
   chatId: string,
   idempotencyKey: string,
-  input: SendMessageRequest,
+  input: Pick<SendMessageRequest, "text"> & {
+    attachmentIds?: string[];
+    planMode?: boolean;
+    interruptRunId?: string;
+    /** REST tool execution: dispatched with the run; no model is called. */
+    directTool?: { name: string; input: Record<string, unknown> };
+  },
 ): Promise<SendMessageResponse> {
   await requireChatOwnership(userId, chatId);
 
   let agentRunId: string;
   let userMessageId: string;
+  let interrupted: { id: string; triggerRunId: string | null } | null;
   try {
-    const { agentRun, message } = await prisma.$transaction(async (tx) => {
+    const admitted = await prisma.$transaction(async (tx) => {
+      let interruptedRun: { id: string; triggerRunId: string | null } | null = null;
+      // Interrupt: the chat's active run is cancelled in the same
+      // transaction that admits this message, so "one active run per chat"
+      // holds throughout and a retried send (same Idempotency-Key) rolls
+      // back both. A run that already finished is simply not cancelled.
+      if (input.interruptRunId) {
+        const target = await tx.agentRun.findFirst({ where: { id: input.interruptRunId, chatId } });
+        if (!target) throw new NotFoundError("Agent run not found");
+        if (await cancelActiveRunInTx(tx, target.id, INTERRUPTED_BY_USER)) {
+          interruptedRun = { id: target.id, triggerRunId: target.triggerRunId };
+        }
+      }
       const agentRun = await tx.agentRun.create({
-        data: { chatId, userId, idempotencyKey, status: "QUEUED" },
+        data: { chatId, userId, idempotencyKey, status: "QUEUED", planMode: input.planMode ?? false },
       });
       const message = await tx.message.create({
         data: {
@@ -73,19 +104,24 @@ export async function sendTurn(
           content: [{ type: "text", text: input.text }],
         },
       });
+      // After the AgentRun insert, so a retried send hits the idempotency
+      // violation first instead of failing on already-attached files.
+      await attachToMessage(tx, userId, chatId, message.id, input.attachmentIds ?? []);
       await tx.chat.update({
         where: { id: chatId },
         data: { lastMessageAt: message.createdAt },
       });
-      return { agentRun, message };
-    });
-    agentRunId = agentRun.id;
-    userMessageId = message.id;
+      return { agentRun, message, interruptedRun };
+      // Also cancels an interrupted run: same options as every run transition.
+    }, RUN_TRANSITION_TRANSACTION_OPTIONS);
+    agentRunId = admitted.agentRun.id;
+    userMessageId = admitted.message.id;
+    interrupted = admitted.interruptedRun;
   } catch (error) {
     const index = violatedIndex(error);
     if (index === IDEMPOTENCY_KEY_INDEX) {
       // Same send, retried — not an error, return what already happened.
-      return readExistingDispatch(idempotencyKey);
+      return readExistingDispatch(userId, chatId, idempotencyKey);
     }
     if (index === ACTIVE_RUN_INDEX) {
       throw new ConflictError("A run is already active for this chat");
@@ -93,9 +129,11 @@ export async function sendTurn(
     throw error;
   }
 
+  if (interrupted) await cancelTriggerRunBestEffort(interrupted.triggerRunId, { agentRunId: interrupted.id, chatId });
+
   try {
     const handle = await runAgentTurn.trigger(
-      { agentRunId },
+      { agentRunId, ...(input.directTool ? { directTool: input.directTool } : {}) },
       { idempotencyKey, idempotencyKeyTTL: "24h" },
     );
     const updated = await prisma.agentRun.update({

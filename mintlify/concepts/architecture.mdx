@@ -1,0 +1,23 @@
+---
+title: Architecture
+description: Two apps, one durable worker, PostgreSQL as the source of truth.
+---
+
+| Component | Responsibility |
+|---|---|
+| **Frontend** (Next.js, separate repo) | Chat UI, TanStack Query server state, realtime subscription, Uppy uploads. No secrets, no business rules. |
+| **Backend** (Next.js route handlers) | Auth and ownership, Zod validation, admission, approvals, media, credits, webhooks. Thin routes over services. |
+| **Worker** (Trigger.dev tasks) | Agent turns, generated-asset archival, credit settlement, webhook delivery, scheduled recovery sweeps. |
+| **PostgreSQL** (Prisma) | The durable record: chats, messages, runs, tool invocations, waitpoints, attachments, ledger. |
+| **Providers** | OpenRouter (free route) for the model; Magica for media tools; Transloadit + Backblaze B2 for files. |
+
+**Request path.** `POST /messages` creates the user message and an `AgentRun` in one transaction
+(one active run per chat, enforced by a partial unique index), then dispatches the durable task
+with the same idempotency key. The response returns immediately (`202`).
+
+**Realtime is transport, not truth.** The worker publishes content-free events in run metadata and
+streams assistant text on a separate stream. Clients reconcile from REST on reload or when the
+transport drops (with a 15-second fallback poll while a run is active).
+
+**Guarded transitions.** Every run status change is a compare-and-set, so a late writer (a retry,
+a cancel, a recovery sweep) can never overwrite a newer outcome.

@@ -31,3 +31,11 @@ Bonus (day 3 only, after mandatory paths work): public REST API, Mintlify docs, 
 ## Repos
 - Backend (this repo): https://github.com/chetanpatel003/agent-chat-backend (private)
 - Frontend: https://github.com/chetanpatel003/agent-chat-frontend (private)
+
+## Requirement coverage status (2026-11-03)
+- Mandatory areas: implemented and tested; see `PROJECT_STATE.md` sprint logs.
+- Magica: Crop Image, GPT Image 2 (generate/edit) real; GPT Image 2 generate live-verified.
+  **Merge Videos admitted for uploaded videos with measured durations** (≤ 300 s, 1.3× estimate; decision 0018 accepted). No live merge run.
+- Bonus: versioned REST API (incl. completions, direct tool runs, run status), signed webhooks,
+  Mintlify docs (`mintlify/`, not hosted). MCP server: not built (optional).
+- Deployment: runbook ready (`DEPLOYMENT.md`); not deployed (owner Vercel login required).

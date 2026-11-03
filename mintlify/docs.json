@@ -1,0 +1,29 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Agent Chat",
+  "colors": { "primary": "#111827", "light": "#f9fafb", "dark": "#111827" },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guides",
+        "groups": [
+          { "group": "Get started", "pages": ["introduction", "quickstart", "authentication", "errors"] },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/agent-runs",
+              "concepts/approvals",
+              "concepts/tools-and-skills",
+              "concepts/media",
+              "concepts/credits"
+            ]
+          },
+          { "group": "Integrate", "pages": ["webhooks", "deployment", "limitations"] }
+        ]
+      },
+      { "tab": "API reference", "openapi": "openapi.json" }
+    ]
+  }
+}

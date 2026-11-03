@@ -1,0 +1,26 @@
+---
+title: Tools and skills
+description: One registry of typed tools; skills loaded on demand.
+---
+
+| Tool | Provider | Billable | Notes |
+|---|---|---|---|
+| `generate_image` | Magica GPT Image 2 | yes | Explicit size required for credit admission. |
+| `edit_image` | Magica GPT Image 2 | yes | Edits attached images. |
+| `crop_image` | Magica Crop Image | yes | Fixed cost. |
+| `merge_videos` | Magica Merge Videos | yes | 2–100 https video URLs, in order; optional `none`/`fade`/`dissolve` transition. Gated at admission. |
+| `load_skill` | application | no | Loads a skill's instructions. |
+| `read_skill_asset` | application | no | Reads a file inside a skill bundle (path-safe). |
+
+Every tool has Zod input and output schemas; invalid input, unknown tools and malformed arguments
+become auditable failed invocations the model can react to. Magica runs are started once, polled
+durably, and reconciled after a crash by their persisted provider run id — never restarted.
+
+**Direct execution.** `POST /api/v1/chats/{chatId}/tool-runs` with `{"tool": "crop_image",
+"input": {…}}` (and an `Idempotency-Key`) runs one media tool without the model, through the same
+validation, credit admission, settlement and recovery path; the result arrives as an assistant
+message. `merge_videos` is refused at admission until its charging rule is approved.
+
+**Skills** live in `agent-skills/<name>/SKILL.md` (`image-analysis`, `image-editing`,
+`video-editing`). The model sees only names and descriptions; it loads a skill's body when needed,
+and the run records each loaded skill and its content hash.

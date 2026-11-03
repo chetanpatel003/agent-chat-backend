@@ -28,6 +28,7 @@ model User {
 
   creditAccount CreditAccount?
   creditLedger  CreditLedger[]
+  webhookEndpoints WebhookEndpoint[]
   chats         Chat[]
   messages      Message[]
   agentRuns     AgentRun[]
@@ -112,6 +113,8 @@ model Message {
   role       MessageRole
   status     MessageStatus @default(COMPLETE)
   content    Json
+  /// Total time the model spent before producing output, across the turn's rounds (assistant only).
+  thinkingMs Int?
   createdAt  DateTime      @default(now()) @db.Timestamptz(6)
 
   chat     Chat      @relation(fields: [chatId], references: [id])
@@ -120,6 +123,8 @@ model Message {
 
   toolInvocations ToolInvocation[]
   attachments     Attachment[]
+  /// What a user message sends, in order: direct uploads and media-library picks.
+  sentAttachments MessageAttachment[]
 
   @@index([chatId, createdAt, id])
   @@index([agentRunId])
@@ -155,6 +160,8 @@ model AgentRun {
   promptTokens     Int?
   completionTokens Int?
   turnCount        Int            @default(0)
+  /// Plan mode: the agent proposes a plan and waits at a PLAN waitpoint before using tools.
+  planMode         Boolean        @default(false)
   retryOfRunId     String?        @db.Uuid
   errorCode        String?
   errorMessage     String?
@@ -217,7 +224,12 @@ model ToolInvocation {
   providerRunId    String?              @unique
   triggerTaskRunId String?
   durationMs       Int?
+  /// Raw credits actually collected from the user's balance at settlement
+  /// (NULL = not yet settled). May be less than creditsUsed if the balance ran out.
   creditsCharged   BigInt?
+  /// Raw credits the provider reported using (Magica `creditUsed`), set at settlement.
+  /// Outstanding shortfall = creditsUsed - creditsCharged.
+  creditsUsed      BigInt?
   errorCode        String?
   errorMessage     String?
   createdAt        DateTime             @default(now()) @db.Timestamptz(6)
@@ -227,6 +239,7 @@ model ToolInvocation {
   message  Message? @relation(fields: [messageId], references: [id])
 
   creditLedgerEntries CreditLedger[]
+  attachments         Attachment[]
 
   @@index([agentRunId, createdAt])
 }
@@ -261,6 +274,7 @@ model Waitpoint {
   agentRun AgentRun @relation(fields: [agentRunId], references: [id])
 
   @@index([agentRunId])
+  @@index([status, expiresAt])
 }
 
 // ---------- Media ----------
@@ -277,6 +291,7 @@ enum AttachmentStatus {
   READY
   FAILED
   EXPIRED
+  CANCELLED
 }
 
 model Attachment {
@@ -291,6 +306,8 @@ model Attachment {
   mimeType          String
   sizeBytes         BigInt?
   url               String?
+  storageKey        String?          @unique
+  toolInvocationId  String?          @db.Uuid
   sanitizedMetadata Json             @default("{}")
   order             Int
   createdAt         DateTime         @default(now()) @db.Timestamptz(6)
@@ -299,7 +316,48 @@ model Attachment {
   user    User     @relation(fields: [userId], references: [id])
   chat    Chat?    @relation(fields: [chatId], references: [id])
   message Message? @relation(fields: [messageId], references: [id])
+  // Generated assets: the Magica tool invocation that produced them.
+  toolInvocation ToolInvocation? @relation(fields: [toolInvocationId], references: [id], onDelete: Restrict)
+  /// Every user message this file was sent with (its first send, then media-library picks).
+  sentWith       MessageAttachment[]
 
+  @@unique([toolInvocationId, order])
   @@index([messageId, order])
   @@index([chatId])
+}
+
+/// A user message's attachments, in send order. One attachment can be sent with
+/// many messages (media library) without copying the file or its record.
+/// `Attachment.messageId` stays the attachment's origin (first send, or the
+/// assistant message that generated it).
+model MessageAttachment {
+  messageId    String   @db.Uuid
+  attachmentId String   @db.Uuid
+  order        Int
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  message    Message    @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  attachment Attachment @relation(fields: [attachmentId], references: [id], onDelete: Cascade)
+
+  @@id([messageId, attachmentId])
+  @@unique([messageId, order])
+  @@index([attachmentId])
+}
+
+// ---------- Outbound webhooks ----------
+
+/// A user's outbound webhook endpoint. `secret` signs every delivery
+/// (HMAC-SHA256); it is returned once, at creation. Disabled, never deleted.
+model WebhookEndpoint {
+  id         String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  userId     String    @db.Uuid
+  url        String
+  secret     String
+  events     String[]
+  createdAt  DateTime  @default(now()) @db.Timestamptz(6)
+  disabledAt DateTime? @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
 }

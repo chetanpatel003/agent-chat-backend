@@ -42,6 +42,34 @@ export const publishRunEvent: PublishRunEvent = (event) => {
   }
 };
 
+/**
+ * Highest `seq` already published for this AgentRun in the current
+ * Trigger.dev run's metadata. Verified against SDK 4.8.3 with a live
+ * retrying task: every attempt of a run starts with the run's flushed
+ * metadata (`taskExecutor` seeds it from `execution.run.metadata`, and
+ * the worker flushes before reporting a failed attempt), so a retry
+ * sees every event an earlier attempt published. Seeding the emitter
+ * from this keeps `seq` unique and increasing across attempts.
+ * Returns 0 outside a task context or when nothing was published yet.
+ */
+export function lastPublishedSeq(runId: string, existing?: unknown): number {
+  let events = existing;
+  if (events === undefined) {
+    try {
+      events = metadata.get("events");
+    } catch {
+      return 0;
+    }
+  }
+  if (!Array.isArray(events)) return 0;
+  let max = 0;
+  for (const item of events) {
+    const parsed = RunEventSchema.safeParse(item);
+    if (parsed.success && parsed.data.runId === runId) max = Math.max(max, parsed.data.seq);
+  }
+  return max;
+}
+
 export type EmitRunEvent = (
   event: DistributiveOmit<RunEvent, "runId" | "seq" | "at">,
 ) => Promise<void>;
@@ -55,8 +83,12 @@ export type EmitRunEvent = (
  * failing test double) from the worker loop — nothing it does can
  * escape as an exception.
  */
-export function createRunEventEmitter(runId: string, publish: PublishRunEvent): EmitRunEvent {
-  let seq = 0;
+export function createRunEventEmitter(
+  runId: string,
+  publish: PublishRunEvent,
+  startAfterSeq = 0,
+): EmitRunEvent {
+  let seq = startAfterSeq;
   return async (event) => {
     seq += 1;
     const full = { ...event, runId, seq, at: new Date().toISOString() } as RunEvent;

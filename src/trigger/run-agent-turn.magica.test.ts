@@ -45,10 +45,10 @@ function toolCall(name: string, args: Record<string, unknown> | string, id = ran
   return { id, type: "function", function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) } };
 }
 function finalAnswer(text: string) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: null, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: null, promptTokens: 1, completionTokens: 1 };
 }
 function toolRequest(calls: ProviderToolCall[], text: string | null = null) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
 }
 
 beforeEach(() => {

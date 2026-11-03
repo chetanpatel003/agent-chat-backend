@@ -1,0 +1,42 @@
+---
+title: Webhooks
+description: Signed lifecycle events with retries.
+---
+
+Register an endpoint (public `https` URL only; up to 5):
+
+```sh
+POST /api/v1/webhooks   {"url":"https://example.com/hooks","events":["agent.completed","agent.failed"]}
+```
+
+The response includes `secret` (`whsec_…`) **once**. Events: `agent.started`, `agent.completed`,
+`agent.failed`, `tool.completed`. Payloads contain ids and statuses only — read content over REST.
+
+```json
+{
+  "id": "evt_agent.completed_01a1…",
+  "type": "agent.completed",
+  "createdAt": "2026-11-03T12:00:00.000Z",
+  "data": { "runId": "01a1…", "chatId": "01a1…", "status": "COMPLETED" }
+}
+```
+
+## Verify the signature
+Headers: `webhook-id`, `webhook-timestamp` (Unix seconds), `webhook-signature: v1,<base64>` where
+the signature is HMAC-SHA256 of `{id}.{timestamp}.{body}` with your secret (Standard Webhooks).
+
+```ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+function verify(secret: string, id: string, timestamp: string, signature: string, body: string) {
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false; // replay window
+  const expected = `v1,${createHmac("sha256", secret).update(`${id}.${timestamp}.${body}`).digest("base64")}`;
+  return signature.split(" ").some((s) => s.length === expected.length && timingSafeEqual(Buffer.from(s), Buffer.from(expected)));
+}
+```
+
+## Delivery
+- Respond `2xx` within 10 seconds. `408`, `429`, `5xx` and network errors are retried up to 6
+  times with backoff (seconds to ~10 minutes). Other `4xx` are not retried.
+- At-least-once: the same event always has the same `id` — deduplicate on it.
+- `DELETE /api/v1/webhooks/{id}` disables an endpoint; queued deliveries to it are skipped.

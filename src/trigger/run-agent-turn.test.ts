@@ -42,14 +42,19 @@ function toolCall(name: string, args: Record<string, unknown> | string, id = ran
 }
 
 function finalAnswer(text: string) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: null, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: null, promptTokens: 1, completionTokens: 1 };
 }
 
 function toolRequest(calls: ProviderToolCall[], text: string | null = null) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
 }
 
-beforeEach(() => mockCallOpenRouter.mockReset());
+// Block body: Vitest treats a function returned from beforeEach as a
+// teardown, and mockReset() returns the mock — which would then be *called*
+// after each test (hanging on a test's never-resolving implementation).
+beforeEach(() => {
+  mockCallOpenRouter.mockReset();
+});
 afterAll(() => cleanupTestUsers(createdUserIds));
 
 const skillFixtureTmpDirs: string[] = [];
@@ -111,6 +116,8 @@ describe("executeAgentTurn — success", () => {
   it("transitions PENDING -> COMPLETE, persists content and the actual routed model", async () => {
     const owner = await user("turn-success");
     const { chat, run } = await setUpRun(owner);
+    // A stray `reasoning` field (as if an adapter regressed and leaked it)
+    // must still never reach persisted user-visible content.
     mockCallOpenRouter.mockResolvedValueOnce({
       model: "nvidia/nemotron-3.5-super-vl:free",
       text: "pong",
@@ -118,7 +125,7 @@ describe("executeAgentTurn — success", () => {
       toolCalls: null,
       promptTokens: 24,
       completionTokens: 49,
-    });
+    } as Awaited<ReturnType<typeof callOpenRouter>>);
 
     const result = await executeAgentTurn({ agentRunId: run.id }, undefined, noopPublish);
     expect(result.status).toBe("COMPLETED");
@@ -133,10 +140,8 @@ describe("executeAgentTurn — success", () => {
       where: { agentRunId: run.id, role: "ASSISTANT" },
     });
     expect(assistantMsg.status).toBe("COMPLETE");
-    expect(assistantMsg.content).toEqual([
-      { type: "thinking", text: "brief reasoning" },
-      { type: "text", text: "pong" },
-    ]);
+    expect(assistantMsg.content).toEqual([{ type: "text", text: "pong" }]);
+    expect(JSON.stringify(assistantMsg.content)).not.toContain("brief reasoning");
 
     const updatedChat = await prisma.chat.findUniqueOrThrow({ where: { id: chat.id } });
     expect(updatedChat.lastMessageAt.getTime()).toBeGreaterThanOrEqual(
@@ -152,7 +157,6 @@ describe("executeAgentTurn — success", () => {
     mockCallOpenRouter.mockResolvedValueOnce({
       model: "x/y:free",
       text: "ok",
-      reasoning: null,
       toolCalls: null,
       promptTokens: 1,
       completionTokens: 1,
@@ -279,7 +283,6 @@ describe("executeAgentTurn — terminal re-entry / duplicate dispatch", () => {
     mockCallOpenRouter.mockResolvedValueOnce({
       model: "x/y:free",
       text: "first",
-      reasoning: null,
       toolCalls: null,
       promptTokens: 1,
       completionTokens: 1,
@@ -325,9 +328,10 @@ describe("executeAgentTurn — tool calling", () => {
     // Checkpoint 3.2: the already-created invocation's own id is now
     // propagated into the execution context — asserted against the
     // real persisted row's id, not just `expect.any(String)`.
+    // Plus the best-effort progress reporter (tool_progress events).
     expect(executeSpy).toHaveBeenCalledWith(
       { timezone: "UTC" },
-      { agentRunId: run.id, userId: owner.id, invocationId: invocation.id },
+      { agentRunId: run.id, userId: owner.id, invocationId: invocation.id, onProgress: expect.any(Function) },
     );
     expect(invocation.status).toBe("COMPLETED");
     expect(invocation.toolName).toBe(FIXTURE_TOOL_NAME);
@@ -1000,11 +1004,14 @@ describe("executeAgentTurn — realtime publishing (publish-after-commit)", () =
 
     await executeAgentTurn({ agentRunId: run.id }, undefined, publish);
 
-    expect(seen.map((s) => s.type)).toEqual(["run_status", "assistant_message", "run_status"]);
-    expect(seen[0].agentRunStatus).toBe("RUNNING");
-    expect(seen[1].agentRunStatus).toBe("COMPLETED");
-    expect(seen[1].messageStatus).toBe("COMPLETE");
-    expect(seen[2].agentRunStatus).toBe("COMPLETED");
+    // Progress events (step/thinking_completed) carry no persisted state; the
+    // publish-after-commit guarantee is about state-bearing events.
+    const stateEvents = seen.filter((s) => s.type === "run_status" || s.type === "assistant_message");
+    expect(stateEvents.map((s) => s.type)).toEqual(["run_status", "assistant_message", "run_status"]);
+    expect(stateEvents[0].agentRunStatus).toBe("RUNNING");
+    expect(stateEvents[1].agentRunStatus).toBe("COMPLETED");
+    expect(stateEvents[1].messageStatus).toBe("COMPLETE");
+    expect(stateEvents[2].agentRunStatus).toBe("COMPLETED");
   });
 
   it("publishes tool_started/tool_completed only after the corresponding ToolInvocation write has committed", async () => {

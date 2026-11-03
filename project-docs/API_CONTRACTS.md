@@ -36,8 +36,8 @@ never drift from the database's actual enum definitions.
 | `/api/v1/chats/[chatId]/messages` | POST | Clerk bearer + ownership | **New.** Requires an `Idempotency-Key` header (required, not optional — see below). `SendMessageRequestSchema` body → `SendMessageResponseSchema`, 202. |
 | `/api/v1/chats/[chatId]/runs/active` | GET | Clerk bearer + ownership | → `AgentRunResponseSchema \| null`. The reconciliation endpoint — "is something in flight for this chat right now." |
 | `/api/v1/chats/[chatId]/runs/[runId]/cancel` | POST | Clerk bearer + ownership | **New (checkpoint 2.4).** → `AgentRunResponseSchema`, 200. Idempotent — an already-terminal run is returned unchanged, no write, no Trigger.dev call. |
-| `/api/v1/credits/balance` | GET | Clerk bearer | → `CreditBalanceResponseSchema`. No account provisioned yet = 0, never auto-created by a GET. |
-| `/api/v1/credits/ledger` | GET | Clerk bearer | `CursorPaginationRequestSchema` query → `PaginatedCreditLedgerResponseSchema` |
+| `/api/v1/credits/balance` | GET | Clerk bearer | → `CreditBalanceResponseSchema`. Raw integer credits (Magica's unit; display ÷1,000,000 as "M"). No account = 0, never auto-created by a GET. |
+| `/api/v1/credits/ledger` | GET | Clerk bearer | `CursorPaginationRequestSchema` query → `PaginatedCreditLedgerResponseSchema`. Raw integer amounts; positive adds, negative (`TOOL_CHARGE`) removes; `balanceAfter` after the entry. |
 
 Every route also implements `OPTIONS` for CORS preflight (`src/lib/cors.ts`).
 
@@ -1007,3 +1007,157 @@ cancelled via its own webhook (polling + local-cancellation-check
 only, unchanged from checkpoint 3.2); no automatic retry of an
 ambiguous start; no Transloadit integration or redesign; no generic
 workflow/orchestration engine beyond the one shared factory.
+
+## Checkpoint 5.1 — Credit accounting and settlement
+
+Authoritative detail: `magica/CREDIT_ACCOUNTING.md`; decision 0014.
+
+- **Unit.** Every credit value (balance, ledger `amount`/`balanceAfter`,
+  `ToolInvocation.creditsCharged`, tool_result `creditsCharged`) is Magica's
+  raw integer unit, stored as BigInt and never scaled. Display only:
+  ÷1,000,000 with an "M" suffix. No response shape changed.
+- **Usage retained.** COMPLETED runs keep `creditUsed` in the normalized
+  output; FAILED/CANCELED Magica runs now persist `ToolInvocation.output =
+  { creditUsed }` (`ProviderRunFailedError`). Error code/message unchanged
+  (`EXECUTION_FAILED`, Magica's message).
+- **Settlement** (`services/credit-settlement.ts`): after each terminal
+  billable invocation and on run recovery. One transaction — account row
+  lock, `creditsCharged IS NULL` claim, `TOOL_CHARGE` ledger row with unique
+  `idempotencyKey = tool-charge:{toolInvocationId}`. Zero usage → settled at
+  0 with no ledger row. Never negative: debits at most the balance and
+  records the shortfall. OpenRouter is never charged. Settlement failure is
+  logged and never changes the tool outcome.
+- **Admission** (`services/credit-admission.ts`, before any Magica call):
+  new tool error codes (via `ToolExecutionError`) —
+  `INSUFFICIENT_CREDITS`, `CREDIT_ESTIMATE_UNAVAILABLE` (estimate failed;
+  fail closed), `EXPLICIT_SIZE_REQUIRED` (GPT Image 2 size Auto/omitted),
+  Provider outcomes (decision 0019): `PROVIDER_OUTCOME_UNKNOWN` (ambiguous start / untracked run —
+  never retried), `PROVIDER_RETRY_BLOCKED` (same tool again in that run), `PROVIDER_OUTPUT_INVALID`
+  (completed without valid media).
+  Merge Videos: `MERGE_SOURCE_UNSUPPORTED`, `MERGE_DURATION_UNKNOWN`,
+  `MERGE_DURATION_LIMIT` (decision 0018; formerly `ADMISSION_POLICY_REQUIRED`). Crop uses a fixed 5,000; GPT
+  Image 2 uses `POST /v1/nodes/estimate-credits`, never `/pricing` tiers.
+- **Not implemented / open:** no credit grant mechanism exists, so all
+  balances are 0 and billable tools are refused until a grant policy is
+  decided; size-Auto and Merge Videos admission policies; reservation.
+
+### Checkpoint 5.1 review follow-up
+- `ToolInvocation.creditsUsed` (new) = actual provider usage; `creditsCharged`
+  = amount collected (unchanged meaning; the tool_result block's
+  `creditsCharged` is the collected amount). Shortfall = the difference.
+- CHECK constraints: non-negative `CreditAccount.balance`; settled
+  invocations satisfy `0 <= creditsCharged <= creditsUsed`.
+- Durable `settle-tool-credits` Trigger.dev task (idempotency key
+  `settle-tool-credits:{toolInvocationId}`, 5 attempts) dispatched after every
+  terminal billable invocation, before the inline attempt; works after the
+  parent run is terminal. No response shape changed.
+
+### Checkpoint 5.1 finalization — recovery sweep
+- New scheduled Trigger.dev task `recover-billable-invocations` (every 10 min,
+  one at a time): reconciles stale RUNNING billable invocations (15 min
+  untouched) via `reconcile(…, { singlePoll: true })` and dispatches
+  settlement for terminal invocations with unsettled reported usage
+  (created on/after 2026-11-02 12:00 UTC; 5 min grace); 25 per category per
+  sweep. Never starts a Magica run. Details: `magica/CREDIT_ACCOUNTING.md`.
+- `ToolDefinition.reconcile` gained an optional `{ singlePoll }` argument;
+  `pollMagicaRunToCompletion` gained optional `maxAttempts`/`requireActiveRun`
+  (defaults unchanged for the agent loop). No API shape changed.
+
+## Core interaction experience (streaming, steps, plan mode, interrupt, parallel tools)
+
+Decision record: `decisions/0015-interaction-experience.md`.
+
+### `POST /api/v1/chats/{chatId}/messages` — two optional body fields
+- `planMode: boolean` (default `false`) — persisted as `AgentRun.planMode`. The agent first
+  proposes a plan (no tools offered) and waits at a **PLAN waitpoint**.
+- `interruptRunId: uuid` — Interrupt: in the **same admission transaction**, that run (must
+  belong to this chat, else 404) is cancelled with `errorCode = INTERRUPTED_BY_USER` (pending
+  assistant message → CANCELLED with content kept; open waitpoints → CANCELLED), then the new
+  message/run is admitted. A run that already finished is left alone. A retried send with the
+  same `Idempotency-Key` returns the first dispatch and changes nothing. The Trigger.dev run is
+  cancelled best-effort after commit. Without `interruptRunId`, sending while a run is active is
+  still `409`.
+
+### Waitpoints (one approval mechanism: `Waitpoint` row + Trigger.dev waitpoint token)
+- `GET /api/v1/chats/{chatId}/runs/{runId}/waitpoints` → `{ items: WaitpointResponse[] }`
+  (oldest first). How a reloaded client restores an open approval.
+- `POST /api/v1/chats/{chatId}/runs/{runId}/waitpoints/{waitpointId}/resolve`, body for PLAN:
+  `{ decision: "approve" | "reject", note?: string ≤ 2000 }`.
+  - Commits PENDING → RESOLVED first (guarded); **the first decision wins** and is returned to
+    every duplicate. Then completes the run's token **only if it is still WAITING** (checked via
+    `wait.retrieveToken`), so a token is completed at most once.
+  - Completion failure after the commit → `503 WaitpointResumeError` ("decision saved…try
+    again"); repeating the request completes the **same** token. The scheduled sweep also
+    redelivers it.
+  - `409` when expired ("…Send a new message to continue."), cancelled (run stopped), or the run
+    already ended. `400` for an invalid decision. `404` for another user's run/waitpoint.
+- PLAN timeout 24 h (`expiresAt`). On timeout the worker (or the sweep) marks it EXPIRED and
+  stops the run: AgentRun CANCELLED `errorCode = WAITPOINT_EXPIRED` with a how-to-continue
+  `errorMessage`; the assistant message (the plan) is kept, status CANCELLED.
+- Resume: the run moves WAITING → RUNNING through a guarded transition and reads the decision
+  from PostgreSQL, so it resumes exactly once. Approve → the plan and the approval (plus note)
+  join the conversation and the normal tool loop continues; reject → the turn completes with the
+  plan as its answer.
+
+### Messages — two response fields
+- `thinkingMs: number | null` — total time-to-first-output across the turn's model rounds
+  (timing only; reasoning is never stored or returned).
+- `error: { code, message } | null` — for FAILED/CANCELLED assistant messages, the run's
+  user-safe reason (`STREAM_INTERRUPTED`, `CANCELLED_BY_USER`, `INTERRUPTED_BY_USER`,
+  `WAITPOINT_EXPIRED`, …). Partial content (streamed text, tool blocks) is kept on failure,
+  stop and interrupt.
+
+### Realtime
+- **Text stream** (separate from metadata): Trigger.dev realtime stream key `assistant-text`,
+  parts `{ messageId, round, delta }` (`contracts/text-stream.ts`). Visible output text only.
+  The pending message is also flushed to PostgreSQL at most once per second while streaming;
+  once a message is terminal the persisted copy is authoritative.
+- **New metadata events** (still no content): `step` (`thinking | responding | waiting`, with
+  `round`), `thinking_completed` (`round`, `durationMs`), `waitpoint` (`waitpointId`,
+  `waitpointType`, `status`). Tool activity keeps its `tool_*` events.
+
+### Agent loop
+- OpenRouter is called with `stream: true` (SSE). The routed model is verified free before any
+  text is forwarded. A dropped stream / missing `[DONE]` → definite `STREAM_INTERRUPTED`;
+  mid-stream `error` → `PROVIDER_ERROR`; bad chunk or incomplete tool call →
+  `MALFORMED_RESPONSE`. All keep the partial text. A network failure before any response stays
+  ambiguous (unchanged).
+- Stop during streaming: the next flush sees the message no longer PENDING, abandons the stream
+  and appends the unflushed text to the CANCELLED message.
+- **Parallel tools**: consecutive calls that are not billable and not provider-backed (no
+  `reconcile`) run concurrently (limit 3); every billable/Magica call runs alone, in order.
+  Reason: credit admission is a balance check, not a reservation, so concurrent billable calls
+  (in one run or across runs) could together overspend. Results, tool messages and content
+  blocks are appended in the model's call order. Each invocation keeps its own row,
+  idempotency key and exactly-once settlement.
+
+### Scheduled sweep `recover-waitpoints` (every 5 min)
+`src/trigger/recover-waitpoints.ts` / `src/services/waitpoint-recovery.ts`: PENDING waitpoints
+5 min past `expiresAt` → expired as above and the Trigger run cancelled; RESOLVED waitpoints
+whose run is still WAITING after 60 s → token completed (once). Batches of 25.
+
+### Stuck-run recovery (decision 0016)
+- New `AgentRun.errorCode` value `RUN_INTERRUPTED` (message is a user-safe retry hint): set by the
+  `recover-stale-runs` sweep when a run was left active with no execution left to finish it.
+  Surfaced on the assistant message's `error` only when that message is FAILED/CANCELLED; the
+  message keeps its content.
+- A Trigger.dev retry attempt of the run's own task recovers a crashed previous attempt
+  immediately (existing `AMBIGUOUS_PROVIDER_OUTCOME`), without a second provider request.
+- All run-transition transactions use `{ maxWait: 10 s, timeout: 20 s }`.
+
+### Approvals after the execution ended (decision 0016 follow-up)
+- `POST .../waitpoints/{id}/resolve` checks the run's Trigger.dev execution first:
+  finished → `409 RunInterruptedError` (run → FAILED `RUN_INTERRUPTED`, waitpoint → CANCELLED,
+  content kept, decision not recorded); status unknown/unreadable → `503
+  ExecutionStatusUnavailableError` (retryable, nothing changed).
+- `MessageResponse.error` is also set for a PENDING assistant message whose run has ended.
+
+## Media library (decision 0017)
+- `GET /api/v1/attachments/library?cursor&limit` → `{ items: AttachmentResponse[], nextCursor, hasMore }`
+  — the caller's sent uploads and generated outputs (READY, archived, supported type, from a
+  non-deleted chat), newest first. `url` is a 1-hour signed B2 URL, or `null` when it can't be
+  signed right now (shown as unavailable).
+- `POST /api/v1/chats/{chatId}/messages` `attachmentIds`: one ordered list mixing new uploads and
+  library item ids. Library items are attached by their existing id — no copy, no new row; they
+  must be usable (else 400 "This media is no longer available"); someone else's id is 404; a
+  duplicate id is 400. A USER message's `attachments` are returned in that send order.

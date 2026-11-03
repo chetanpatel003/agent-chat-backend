@@ -54,3 +54,13 @@ milestone has been reviewed, implement the rest"). Mocked tests for
 `generate_image` cover the full tool-call lifecycle (persistence,
 reconciliation, ambiguous-start handling); only this one live call
 exercised the real Magica API.
+
+
+## Transloadit video duration (2026-11-03, one approved upload — D4)
+Not a Magica call. One 3.0 s, 160×120 synthetic H.264 MP4 (2,876 bytes, generated locally with
+AVFoundation; solid colour, no personal content) uploaded once through the app's normal flow in the
+test chat — create → signed authorization → Assembly (tus) → backend `completeUpload`, which re-reads
+the Assembly server-side. Result: attachment READY, `video/mp4`, `durationSeconds: 3` (ground truth
+3.0 s), `width: 160`, `height: 120`, archived to B2 (`uploads/<user>/<id>.mp4`), no message attached.
+No retries; free Community plan. Limitation: one integer-length sample, so precision for fractional
+lengths isn't shown.

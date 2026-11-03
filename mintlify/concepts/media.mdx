@@ -1,0 +1,18 @@
+---
+title: Media
+description: Uploads, permanent storage and the media library.
+---
+
+1. `POST /api/v1/attachments` — declare the file (type and size are checked: PNG/JPEG/WebP up to
+   20 MB, MP4/MOV/WebM up to 200 MB, 10 per message).
+2. `POST /attachments/{id}/upload-authorization` — server-signed Transloadit parameters (the secret
+   never leaves the backend). Upload with Uppy (tus, resumable).
+3. `POST /attachments/{id}/complete` — the backend verifies the Assembly itself, then copies the
+   file to a **private Backblaze B2 bucket** before marking it `READY`.
+
+Files are served only as **one-hour signed URLs** for their owner. Generated images and videos are
+archived the same way after the tool completes.
+
+**Media library** — `GET /api/v1/attachments/library` lists your sent uploads and generated
+outputs. Send any of them again by id in `attachmentIds`, in any order mixed with new uploads; no
+copy is made.

@@ -9,6 +9,31 @@ vi.mock("@/providers/magica", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/providers/magica")>();
   return { ...actual, startMagicaRun: vi.fn(), getMagicaRun: vi.fn() };
 });
+// These tests cover tool execution, not archival (generated-assets.test.ts
+// does): keep fixture output URLs from ever being fetched.
+// Admission (balance/estimate checks) is covered by credit-admission.test.ts;
+// these tests cover execution, so admission is allowed here.
+vi.mock("@/services/credit-admission", () => ({ admitBillableRun: vi.fn().mockResolvedValue(BigInt(0)) }));
+// merge_videos' source/duration admission (merge-admission.test.ts) needs real uploads; the
+// execution tests below use placeholder URLs, so it is allowed here too.
+vi.mock("@/services/merge-admission", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/merge-admission")>();
+  return { ...actual, resolveMergeSources: vi.fn().mockResolvedValue({ videoCount: 2, totalSeconds: 10 }) };
+});
+// Never dispatch a real Trigger.dev settlement task from these tests (inline settlement still runs).
+vi.mock("@/trigger/settle-tool-credits", () => ({ dispatchCreditSettlement: vi.fn().mockResolvedValue(true) }));
+// Never dispatch a real Trigger.dev archival task from these tests.
+vi.mock("@/trigger/archive-generated-assets", () => ({
+  dispatchGeneratedAssetArchival: vi.fn().mockResolvedValue("dispatched"),
+}));
+vi.mock("@/services/generated-assets", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/generated-assets")>();
+  return {
+    ...actual,
+    archiveInvocationOutputs: vi.fn().mockResolvedValue(undefined),
+    archiveRunGeneratedAssets: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 import { callOpenRouter, type ProviderToolCall } from "@/providers/openrouter";
 import { startMagicaRun, getMagicaRun } from "@/providers/magica";
@@ -17,11 +42,18 @@ import { makeTestUser, cleanupTestUsers } from "@/test-utils/db-fixtures";
 import { createToolRegistry, toOpenRouterTools, PRODUCTION_TOOL_REGISTRY } from "./registry";
 import { generateImageTool, editImageTool, cropImageTool, mergeVideosTool } from "./magica-tools";
 import { executeAgentTurn } from "@/trigger/run-agent-turn";
+import { dispatchGeneratedAssetArchival } from "@/trigger/archive-generated-assets";
+import { dispatchCreditSettlement } from "@/trigger/settle-tool-credits";
 import type { PublishRunEvent } from "@/realtime/publish-run-event";
+import type { RunEvent } from "@/contracts/run-event";
 
 const mockCallOpenRouter = vi.mocked(callOpenRouter);
 const mockStartMagicaRun = vi.mocked(startMagicaRun);
 const mockGetMagicaRun = vi.mocked(getMagicaRun);
+// Agent-loop tests now also settle credits (a locked transaction against the
+// remote test database); measured at ~20.6s, just over the 20s suite default.
+const AGENT_LOOP_WITH_SETTLEMENT_TIMEOUT_MS = 40_000;
+
 const createdUserIds: string[] = [];
 const noopPublish: PublishRunEvent = vi.fn().mockResolvedValue(undefined);
 
@@ -53,10 +85,10 @@ function toolCall(name: string, args: Record<string, unknown>, id = randomUUID()
   return { id, type: "function", function: { name, arguments: JSON.stringify(args) } };
 }
 function finalAnswer(text: string) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: null, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: null, promptTokens: 1, completionTokens: 1 };
 }
 function toolRequest(calls: ProviderToolCall[], text: string | null = null) {
-  return { model: "x/y:free", text, reasoning: null, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
+  return { model: "x/y:free", text, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
 }
 function pollResult(overrides: Partial<Record<string, unknown>> = {}) {
   return { id: "x", nodeType: "gpt_image_2", status: "RUNNING", createdAt: "2026-01-01T00:00:00Z", ...overrides };
@@ -134,7 +166,7 @@ describe("generate_image — registration and OpenRouter schema generation", () 
   });
 });
 
-describe("generate_image — through the real agent loop", () => {
+describe("generate_image — through the real agent loop", { timeout: AGENT_LOOP_WITH_SETTLEMENT_TIMEOUT_MS }, () => {
   it("starts once with the correct nodeType/subModelId, persists providerRunId, and completes with normalized output", async () => {
     const owner = await user("genimg-happy-path");
     const { run } = await setUpRun(owner);
@@ -161,6 +193,8 @@ describe("generate_image — through the real agent loop", () => {
       images: ["https://cdn.example.com/out.png"],
       creditUsed: 42,
     });
+    // Archival is dispatched as its own task, once, after COMPLETED is persisted.
+    expect(vi.mocked(dispatchGeneratedAssetArchival)).toHaveBeenCalledWith(invocation.id);
   });
 
   it("extracts images from the real observed output shape ({result: [...]}, confirmed by one live call — see LIVE_VERIFICATION.md), not the unverified {images: [...]} guess", async () => {
@@ -184,7 +218,7 @@ describe("generate_image — through the real agent loop", () => {
     expect(invocation.output).toEqual({ raw: rawOutput, images: ["https://static.magica.com/real-example.png"], creditUsed: 8385 });
   });
 
-  it("preserves the complete raw output even when no images array is present, without inventing one", async () => {
+  it("a completed run with no recognisable media is a visible PROVIDER_OUTPUT_INVALID failure, never an empty success", async () => {
     const owner = await user("genimg-no-images-field");
     const { run } = await setUpRun(owner);
     const call = toolCall("generate_image", { prompt: "x" });
@@ -197,7 +231,66 @@ describe("generate_image — through the real agent loop", () => {
     await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([generateImageTool]), noopPublish);
 
     const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
-    expect(invocation.output).toEqual({ raw: { somethingElse: true } });
+    // M2 (audit 2026-11-03): formerly persisted as COMPLETED `{ raw }` with nothing to show.
+    expect(invocation.status).toBe("FAILED");
+    expect(invocation.errorCode).toBe("PROVIDER_OUTPUT_INVALID");
+    expect(JSON.stringify(invocation.output ?? {})).not.toContain("images"); // nothing invented
+  });
+
+  it("reports provider_waiting once, after the provider accepted the job and before its result", async () => {
+    const owner = await user("genimg-progress");
+    const { run } = await setUpRun(owner);
+    const events: RunEvent[] = [];
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([toolCall("generate_image", { prompt: "x", size: "1024x1024" })]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    mockStartMagicaRun.mockResolvedValueOnce({ runId: "magica_run_progress" });
+    mockGetMagicaRun.mockResolvedValueOnce(pollResult({ status: "COMPLETED", output: { result: ["https://g.tlcdn.com/gen/p.png"] }, creditUsed: 1 }));
+
+    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([generateImageTool]), (e) => {
+      events.push(e);
+    });
+
+    const toolEvents = events.filter((e) => e.type.startsWith("tool_")).map((e) => e.type);
+    expect(toolEvents).toEqual(["tool_started", "tool_progress", "tool_completed"]);
+    const progress = events.find((e) => e.type === "tool_progress");
+    expect(progress).toMatchObject({ toolName: "generate_image", phase: "provider_waiting" });
+    // Emitted with a seq between start and completion, so the UI can order it.
+    const seqOf = (type: string) => events.find((e) => e.type === type)?.seq ?? -1;
+    expect(seqOf("tool_started")).toBeLessThan(seqOf("tool_progress"));
+    expect(seqOf("tool_progress")).toBeLessThan(seqOf("tool_completed"));
+  });
+
+  it("does not report provider_waiting when the start itself fails", async () => {
+    const owner = await user("genimg-progress-nostart");
+    const { run } = await setUpRun(owner);
+    const events: RunEvent[] = [];
+    const { MagicaAmbiguousError } = await import("@/providers/magica");
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([toolCall("generate_image", { prompt: "x", size: "1024x1024" })]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    mockStartMagicaRun.mockRejectedValueOnce(new MagicaAmbiguousError("HTTP 500", "MAGICA_START_AMBIGUOUS_5XX"));
+
+    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([generateImageTool]), (e) => {
+      events.push(e);
+    });
+    expect(events.some((e) => e.type === "tool_progress")).toBe(false);
+    expect(mockStartMagicaRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failing progress publish never affects the started run (no failure, no second start)", async () => {
+    const owner = await user("genimg-progress-publish-fails");
+    const { run } = await setUpRun(owner);
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([toolCall("generate_image", { prompt: "x", size: "1024x1024" })]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    mockStartMagicaRun.mockResolvedValueOnce({ runId: "magica_run_progress_fail" });
+    mockGetMagicaRun.mockResolvedValueOnce(pollResult({ status: "COMPLETED", output: { result: ["https://g.tlcdn.com/gen/q.png"] }, creditUsed: 1 }));
+
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([generateImageTool]), (e) => {
+      if (e.type === "tool_progress") throw new Error("realtime down");
+    });
+    expect(result.status).toBe("COMPLETED");
+    expect(mockStartMagicaRun).toHaveBeenCalledTimes(1);
+    const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
+    expect(invocation.status).toBe("COMPLETED");
   });
 
   it("an ambiguous start is recorded as a failed tool call and never automatically resubmitted", async () => {
@@ -235,6 +328,73 @@ describe("generate_image — through the real agent loop", () => {
     expect(invocation.errorMessage).toBe("content policy violation");
   });
 
+  it("keeps a failed run's reported usage, with unchanged error semantics, and settles it", async () => {
+    const owner = await user("genimg-failed-usage");
+    await prisma.creditAccount.create({ data: { userId: owner.id, balance: BigInt(100_000) } });
+    const { run } = await setUpRun(owner);
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([toolCall("generate_image", { prompt: "x", size: "1024x1024" })]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    mockStartMagicaRun.mockResolvedValueOnce({ runId: "magica_run_failed_usage" });
+    mockGetMagicaRun.mockResolvedValueOnce(pollResult({ status: "FAILED", userMessage: "content policy violation", creditUsed: 5000 }));
+
+    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([generateImageTool]), noopPublish);
+
+    const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
+    expect(invocation).toMatchObject({
+      status: "FAILED",
+      errorCode: "EXECUTION_FAILED",
+      errorMessage: "content policy violation",
+      output: { creditUsed: 5000 },
+      creditsCharged: BigInt(5000),
+    });
+    expect((await prisma.creditAccount.findUniqueOrThrow({ where: { userId: owner.id } })).balance).toBe(BigInt(95_000));
+  });
+
+  it("settles a completed run's raw creditUsed and reports it on the tool_result block", async () => {
+    const owner = await user("genimg-settled");
+    await prisma.creditAccount.create({ data: { userId: owner.id, balance: BigInt(1_000_000) } });
+    const { run } = await setUpRun(owner);
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([toolCall("generate_image", { prompt: "x", quality: "High", size: "1024x1024" })]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    mockStartMagicaRun.mockResolvedValueOnce({ runId: "magica_run_settled" });
+    mockGetMagicaRun.mockResolvedValueOnce(
+      pollResult({ status: "COMPLETED", output: { result: ["https://cdn.example.com/k.png"] }, creditUsed: 273936 }),
+    );
+
+    await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([generateImageTool]), noopPublish);
+
+    const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
+    expect(invocation.creditsCharged).toBe(BigInt(273936));
+    expect((await prisma.creditAccount.findUniqueOrThrow({ where: { userId: owner.id } })).balance).toBe(BigInt(726_064));
+    const message = await prisma.message.findFirstOrThrow({ where: { agentRunId: run.id, role: "ASSISTANT" } });
+    const result = (message.content as Array<Record<string, unknown>>).find((b) => b.type === "tool_result");
+    expect(result?.creditsCharged).toBe(273936);
+    expect(vi.mocked(dispatchCreditSettlement)).toHaveBeenCalledWith(invocation.id);
+  });
+
+  it("keeps the charge recoverable when inline settlement fails: outcome unchanged, durable settlement dispatched", async () => {
+    const owner = await user("genimg-settle-fails");
+    await prisma.creditAccount.create({ data: { userId: owner.id, balance: BigInt(1_000_000) } });
+    const { run } = await setUpRun(owner);
+    mockCallOpenRouter.mockResolvedValueOnce(toolRequest([toolCall("generate_image", { prompt: "x", size: "1024x1024" })]));
+    mockCallOpenRouter.mockResolvedValueOnce(finalAnswer("done"));
+    mockStartMagicaRun.mockResolvedValueOnce({ runId: "magica_run_settle_fails" });
+    mockGetMagicaRun.mockResolvedValueOnce(
+      pollResult({ status: "COMPLETED", output: { result: ["https://cdn.example.com/s.png"] }, creditUsed: 5000 }),
+    );
+    const spy = vi.spyOn(prisma, "$transaction").mockRejectedValueOnce(new Error("connection reset"));
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await executeAgentTurn({ agentRunId: run.id }, createToolRegistry([generateImageTool]), noopPublish);
+    spy.mockRestore();
+
+    expect(result.status).toBe("COMPLETED");
+    const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
+    expect(invocation.status).toBe("COMPLETED");
+    expect(invocation.creditsCharged).toBeNull(); // not yet collected …
+    expect(vi.mocked(dispatchCreditSettlement)).toHaveBeenCalledWith(invocation.id); // … but durably queued
+  });
+
   it("a persistence failure after 202 (the invocation moved on before the write landed) never triggers another start", async () => {
     const owner = await user("genimg-persist-failure");
     const { run } = await setUpRun(owner);
@@ -257,18 +417,17 @@ describe("generate_image — through the real agent loop", () => {
     expect(mockStartMagicaRun).toHaveBeenCalledTimes(1); // never called a second time
     expect(mockGetMagicaRun).not.toHaveBeenCalled(); // never reaches polling
 
-    // execute() threw a plain Error (not MagicaPollInconclusiveError),
-    // so runOneToolCall's existing, already-established mechanism
-    // persists it as an ordinary tool-execution failure — the same
-    // outcome any other execute()-throws case gets.
+    // The run may exist at Magica but can't be tracked: recorded as an
+    // unknown provider outcome (H1), which also blocks further calls to
+    // this tool in the run — still never a second start.
     const invocation = await prisma.toolInvocation.findFirstOrThrow({ where: { agentRunId: run.id } });
     expect(invocation.status).toBe("FAILED");
-    expect(invocation.errorCode).toBe("EXECUTION_FAILED");
+    expect(invocation.errorCode).toBe("PROVIDER_OUTCOME_UNKNOWN");
     expect(invocation.providerRunId).toBeNull(); // the persistence write never landed
   });
 });
 
-describe("generate_image — reconciliation on re-entry", () => {
+describe("generate_image — reconciliation on re-entry", { timeout: AGENT_LOOP_WITH_SETTLEMENT_TIMEOUT_MS }, () => {
   it("a completed remote run discovered by reconcile() is persisted; never starts a second run", async () => {
     const owner = await user("genimg-reconcile-completed");
     const { chat, run } = await setUpRun(owner);
@@ -353,7 +512,7 @@ describe("edit_image — input validation (real discovered gpt-image-2-edit sche
   });
 });
 
-describe("edit_image — registration and through the real agent loop", () => {
+describe("edit_image — registration and through the real agent loop", { timeout: AGENT_LOOP_WITH_SETTLEMENT_TIMEOUT_MS }, () => {
   it("is registered in PRODUCTION_TOOL_REGISTRY", () => {
     expect(PRODUCTION_TOOL_REGISTRY.get("edit_image")).toBe(editImageTool);
   });
@@ -443,7 +602,7 @@ describe("crop_image — input validation (real discovered schema)", () => {
   });
 });
 
-describe("crop_image — registration and through the real agent loop", () => {
+describe("crop_image — registration and through the real agent loop", { timeout: AGENT_LOOP_WITH_SETTLEMENT_TIMEOUT_MS }, () => {
   it("is registered in PRODUCTION_TOOL_REGISTRY", () => {
     expect(PRODUCTION_TOOL_REGISTRY.get("crop_image")).toBe(cropImageTool);
   });
@@ -540,7 +699,7 @@ describe("merge_videos — input validation (real discovered schema)", () => {
   });
 });
 
-describe("merge_videos — registration and through the real agent loop", () => {
+describe("merge_videos — registration and through the real agent loop", { timeout: AGENT_LOOP_WITH_SETTLEMENT_TIMEOUT_MS }, () => {
   it("is registered in PRODUCTION_TOOL_REGISTRY", () => {
     expect(PRODUCTION_TOOL_REGISTRY.get("merge_videos")).toBe(mergeVideosTool);
   });

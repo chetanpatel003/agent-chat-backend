@@ -14,6 +14,12 @@ export type AuthContext = {
   user: User;
 };
 
+/** Starting balance for every newly signed-up user, in raw integer credits
+ * (displayed as "3M"). Granted once, at local user creation. */
+export const SIGNUP_GRANT_CREDITS = BigInt(3_000_000);
+
+export const signupGrantIdempotencyKey = (clerkUserId: string) => `signup-grant:${clerkUserId}`;
+
 function extractBearerToken(request: Request): string {
   const header = request.headers.get("authorization");
   if (!header?.startsWith("Bearer ")) {
@@ -57,6 +63,10 @@ async function resolveLocalUser(clerkUserId: string): Promise<User> {
   // throws a real unique-constraint error rather than resolving. create()
   // throwing P2002 is the actual database-level guarantee; the loser of
   // the race just re-reads the row the winner created.
+  //
+  // The sign-up grant is part of the same nested write (one transaction):
+  // a new user never exists without their starting balance and its ledger
+  // entry, and the race loser creates neither.
   try {
     return await prisma.user.create({
       data: {
@@ -66,6 +76,16 @@ async function resolveLocalUser(clerkUserId: string): Promise<User> {
           [profile.firstName, profile.lastName].filter(Boolean).join(" ") ||
           null,
         imageUrl: profile.imageUrl || null,
+        creditAccount: { create: { balance: SIGNUP_GRANT_CREDITS } },
+        creditLedger: {
+          create: {
+            amount: SIGNUP_GRANT_CREDITS,
+            type: "GRANT",
+            idempotencyKey: signupGrantIdempotencyKey(clerkUserId),
+            balanceAfter: SIGNUP_GRANT_CREDITS,
+            description: "Sign-up grant",
+          },
+        },
       },
     });
   } catch (error) {

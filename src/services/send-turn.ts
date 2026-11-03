@@ -1,3 +1,5 @@
+import { dispatchChatTitle } from "@/trigger/generate-chat-title";
+import { runAfterResponse } from "@/lib/after-response";
 import { prisma } from "@/lib/prisma";
 import { Prisma } from "@/generated/prisma/client";
 import { ConflictError, NotFoundError } from "@/lib/errors";
@@ -140,6 +142,9 @@ export async function sendTurn(
       where: { id: agentRunId },
       data: { triggerRunId: handle.id },
     });
+    // A new chat's first message also gets a title — scheduled to run after
+    // the response is sent (no query or dispatch on this path; never throws).
+    if (!input.directTool) runAfterResponse("chat-title", () => maybeDispatchChatTitle(updated.chatId));
     return {
       chatId: updated.chatId,
       messageId: userMessageId,
@@ -160,5 +165,23 @@ export async function sendTurn(
       },
     });
     throw error;
+  }
+}
+
+/**
+ * Starts title generation only for an untitled chat whose first user message
+ * this is — existing chats with history are never renamed, and a chat with a
+ * manual title is skipped. Runs after the response (see runAfterResponse).
+ * Best-effort: failures are logged, never thrown.
+ */
+export async function maybeDispatchChatTitle(chatId: string): Promise<void> {
+  try {
+    const chat = await prisma.chat.findUnique({ where: { id: chatId }, select: { title: true } });
+    if (!chat || chat.title !== null) return;
+    const userMessages = await prisma.message.count({ where: { chatId, role: "USER" } });
+    if (userMessages !== 1) return;
+    await dispatchChatTitle(chatId);
+  } catch (error) {
+    console.error("Chat title check failed", { chatId, error: error instanceof Error ? error.name : "UnknownError" });
   }
 }

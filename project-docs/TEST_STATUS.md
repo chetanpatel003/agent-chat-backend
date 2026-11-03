@@ -516,3 +516,19 @@ Update this table (don't narrate) after each phase's test step.
   attach / no M2 check) fail 2 / 4 / 5 of them.
 - `magica-tools.test.ts`: two expectations changed by design (no-media completion is now
   `PROVIDER_OUTPUT_INVALID`; 202-then-persistence-failure is now `PROVIDER_OUTCOME_UNKNOWN`).
+
+
+## Automatic chat titles (2026-11-04) — mocked providers only
+- `src/services/chat-title.test.ts` (new, 22): title cleaning and caps, deterministic fallback, model
+  success / throw / empty / junk → fallback, task body titles an untitled chat, never overwrites a
+  manual title (before or during generation), three concurrent generations → exactly one title, no
+  text → no title; `sendTurn` starts it once for a first message only, never for existing chats,
+  titled chats or direct tool runs, and a dispatch failure never fails the send. Removing the
+  `title: null` write guard fails 2 of them.
+- Six existing test files that reach `sendTurn` now mock the title dispatch, so no test can reach
+  Trigger.dev through it.
+- Deferred title check (pre-PR review fix): `src/lib/after-response.test.ts` (new, 3) — work is handed to
+  `after()` and not run before the response; deferred failures are swallowed; with the real Next.js
+  `after()` outside a request scope it never throws and skips the work. `chat-title.test.ts` sendTurn
+  suite now captures scheduled work: nothing (no eligibility query, no dispatch) runs before `sendTurn`
+  returns; a deferred failure leaves the admitted message intact. Reverting to an awaited call fails it.

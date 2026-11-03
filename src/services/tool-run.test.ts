@@ -27,6 +27,8 @@ beforeEach(() => {
   vi.mocked(runAgentTurn.trigger).mockClear();
 });
 afterAll(() => cleanupTestUsers(createdUserIds));
+// Title generation is dispatched after every first message; never let a test reach Trigger.dev through it.
+vi.mock("@/trigger/generate-chat-title", () => ({ dispatchChatTitle: vi.fn().mockResolvedValue(true) }));
 async function user(label: string) {
   const u = await makeTestUser(label);
   createdUserIds.push(u.id);

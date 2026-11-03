@@ -12,6 +12,7 @@ import { sanitizeAssistantText } from "@/contracts/assistant-text";
 import type { Attachment, Message, Prisma } from "@/generated/prisma/client";
 import type { AgentRunStatus } from "@/generated/prisma/enums";
 import { ACTIVE_RUN_STATUSES } from "@/services/run-transitions";
+import { runDurationMs } from "@/services/run-duration";
 
 /** `ownerUserId` is the authenticated caller, already verified as the chat's owner. */
 type MessageRow = Message & {
@@ -19,7 +20,13 @@ type MessageRow = Message & {
   attachments: Attachment[];
   /** A user message's attachments, in send order (uploads and media-library picks). */
   sentAttachments: { attachment: Attachment }[];
-  agentRun: { status: AgentRunStatus; errorCode: string | null; errorMessage: string | null } | null;
+  agentRun: {
+    status: AgentRunStatus;
+    errorCode: string | null;
+    errorMessage: string | null;
+    createdAt: Date;
+    completedAt: Date | null;
+  } | null;
 };
 
 /**
@@ -106,6 +113,7 @@ async function toMessageResponse(message: MessageRow, ownerUserId: string, settl
       }),
     attachments: await Promise.all(attachmentsOf(message).map((a) => toAttachmentResponse(a, ownerUserId))),
     thinkingMs: message.thinkingMs,
+    runDurationMs: message.role === "ASSISTANT" ? runDurationMs(message.agentRun) : null,
     error: messageError(message),
     createdAt: message.createdAt.toISOString(),
   };
@@ -148,7 +156,7 @@ export async function listMessages(
     include: {
       attachments: { orderBy: { order: "asc" } },
       sentAttachments: { orderBy: { order: "asc" }, include: { attachment: true } },
-      agentRun: { select: { status: true, errorCode: true, errorMessage: true } },
+      agentRun: { select: { status: true, errorCode: true, errorMessage: true, createdAt: true, completedAt: true } },
     },
   });
 

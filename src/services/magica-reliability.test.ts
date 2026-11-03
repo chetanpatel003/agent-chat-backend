@@ -214,6 +214,53 @@ const deps = () => ({
   dispatchArchival: vi.fn().mockResolvedValue(undefined),
 });
 
+describe("Stop during a Magica job: the provider finishes after the cancellation (edge-case audit)", { timeout: E2E_TIMEOUT_MS }, () => {
+  /** A turn the user stopped while its Magica run was in flight (worker cancelled; provider keeps going). */
+  async function stoppedTurn(label: string) {
+    const u = await user(label);
+    const { chat, run } = await queuedRun(u.id);
+    const message = await prisma.message.create({
+      data: { chatId: chat.id, userId: u.id, agentRunId: run.id, role: "ASSISTANT", status: "CANCELLED", content: [{ type: "text", text: "Generating" }] },
+    });
+    const invocation = await prisma.toolInvocation.create({
+      data: { agentRunId: run.id, messageId: message.id, toolName: "generate_image", idempotencyKey: randomUUID(), input: { prompt: "a cat", size: "1024x1024" }, status: "RUNNING", providerRunId: `stopped_${randomUUID()}` },
+    });
+    await prisma.agentRun.update({ where: { id: run.id }, data: { status: "CANCELLED", errorCode: "CANCELLED_BY_USER", completedAt: new Date() } });
+    await age(run.id, invocation.id);
+    return { u, run, message, invocation };
+  }
+
+  it("the cancellation stands: message and run stay CANCELLED, the paid result is attached once and charged once (existing policy)", async () => {
+    const { u, run, message, invocation } = await stoppedTurn("stop-late-success");
+    pollFor(invocation.providerRunId as string, { output: { result: [IMAGE] }, creditUsed: 68_484 });
+
+    await sweepBillableInvocations(deps());
+    await sweepBillableInvocations(deps()); // repeated sweep: no second attach or charge
+
+    expect((await prisma.agentRun.findUniqueOrThrow({ where: { id: run.id } })).status).toBe("CANCELLED");
+    const updated = await prisma.message.findUniqueOrThrow({ where: { id: message.id } });
+    expect(updated.status).toBe("CANCELLED"); // never turned into a COMPLETE answer
+    const blocks = MessageContentSchema.parse(updated.content);
+    expect(blocks.filter((b) => b.type === "tool_result")).toHaveLength(1);
+    expect(startMagicaRun).not.toHaveBeenCalled(); // never resubmitted
+    const ledger = await prisma.creditLedger.findMany({ where: { userId: u.id, type: "TOOL_CHARGE" } });
+    expect(ledger.map((l) => l.amount)).toEqual([BigInt(-68_484)]);
+    const account = await prisma.creditAccount.findUniqueOrThrow({ where: { userId: u.id } });
+    expect(account.balance).toBe(BigInt(10_000_000 - 68_484)); // balance consistent with the ledger
+  });
+
+  it("a provider failure after the cancellation is recorded as failed and charged only its reported usage", async () => {
+    const { u, message, invocation } = await stoppedTurn("stop-late-failure");
+    pollFor(invocation.providerRunId as string, { status: "FAILED", error: "content policy", creditUsed: 0 });
+
+    await sweepBillableInvocations(deps());
+
+    expect((await prisma.toolInvocation.findUniqueOrThrow({ where: { id: invocation.id } })).status).toBe("FAILED");
+    expect((await prisma.message.findUniqueOrThrow({ where: { id: message.id } })).status).toBe("CANCELLED");
+    expect(await prisma.creditLedger.count({ where: { userId: u.id, type: "TOOL_CHARGE" } })).toBe(0);
+  });
+});
+
 describe("H2 — a result recovered after the polling budget appears in the chat, settled once", { timeout: E2E_TIMEOUT_MS }, () => {
   it("the sweep adds tool_use + tool_result to the turn's own message and shows it as a result, not 'interrupted'", async () => {
     const { u, chat, message, invocation } = await timedOutTurn("h2-recover", { text: "Generating your image" });

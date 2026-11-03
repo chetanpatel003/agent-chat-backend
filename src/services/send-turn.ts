@@ -133,11 +133,13 @@ export async function sendTurn(
 
   if (interrupted) await cancelTriggerRunBestEffort(interrupted.triggerRunId, { agentRunId: interrupted.id, chatId });
 
+  let dispatchedTriggerRunId: string | null = null;
   try {
     const handle = await runAgentTurn.trigger(
       { agentRunId, ...(input.directTool ? { directTool: input.directTool } : {}) },
       { idempotencyKey, idempotencyKeyTTL: "24h" },
     );
+    dispatchedTriggerRunId = handle.id;
     const updated = await prisma.agentRun.update({
       where: { id: agentRunId },
       data: { triggerRunId: handle.id },
@@ -155,8 +157,16 @@ export async function sendTurn(
     // The transaction committed but dispatch itself failed (network,
     // Trigger.dev outage) — fail closed and surface it clearly rather
     // than return a 202 for a run nothing will ever process.
-    await prisma.agentRun.update({
-      where: { id: agentRunId },
+    //
+    // Guarded on QUEUED: a failure can be ambiguous (the trigger reached
+    // Trigger.dev but its response was lost, or the triggerRunId write
+    // failed), and by now the worker may already own the run (RUNNING) or
+    // the user may have stopped it (CANCELLED). Those states are never
+    // overwritten. A run still QUEUED is failed closed, and a dispatched
+    // Trigger.dev run is cancelled best-effort; if it starts anyway, the
+    // worker's own guarded QUEUED→RUNNING transition skips the FAILED run.
+    const failedClosed = await prisma.agentRun.updateMany({
+      where: { id: agentRunId, status: "QUEUED" },
       data: {
         status: "FAILED",
         errorCode: "DISPATCH_FAILED",
@@ -164,6 +174,8 @@ export async function sendTurn(
         completedAt: new Date(),
       },
     });
+    // Only a run we just failed is cancelled — never one the worker owns.
+    if (failedClosed.count > 0) await cancelTriggerRunBestEffort(dispatchedTriggerRunId, { agentRunId, chatId });
     throw error;
   }
 }

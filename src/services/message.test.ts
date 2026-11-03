@@ -282,6 +282,37 @@ describe("listMessages — run outcome fields", () => {
   });
 });
 
+describe("listMessages — runDurationMs (measured, never estimated)", () => {
+  it("is run creation → completion for a finished turn, null while active, null for a late-recovered result, null for user messages", async () => {
+    const owner = await user("msg-run-duration");
+    const chat = await prisma.chat.create({ data: { userId: owner.id } });
+    const t0 = new Date("2026-11-04T10:00:00.000Z");
+    const run = (status: "COMPLETED" | "RUNNING" | "FAILED", completedAt: Date | null) =>
+      prisma.agentRun.create({
+        data: { chatId: chat.id, userId: owner.id, idempotencyKey: randomUUID(), status, createdAt: t0, completedAt },
+      });
+    // A long Merge Videos turn: ~4 s thinking, minutes of tool work.
+    const merged = await run("COMPLETED", new Date(t0.getTime() + 192_500));
+    const active = await run("RUNNING", null);
+    const recovered = await run("FAILED", new Date(t0.getTime() + 60_000));
+    const assistant = (agentRunId: string, status: "COMPLETE" | "PENDING", at: number) =>
+      prisma.message.create({
+        data: { chatId: chat.id, userId: owner.id, agentRunId, role: "ASSISTANT", status, thinkingMs: 4_000, content: [], createdAt: new Date(t0.getTime() + at) },
+      });
+    await prisma.message.create({ data: { chatId: chat.id, userId: owner.id, role: "USER", content: [{ type: "text", text: "merge" }], createdAt: t0 } });
+    await assistant(merged.id, "COMPLETE", 1);
+    await assistant(active.id, "PENDING", 2);
+    await assistant(recovered.id, "COMPLETE", 3); // result attached after the run ended (H2)
+
+    const [userMsg, mergedMsg, activeMsg, recoveredMsg] = (await listMessages(owner.id, chat.id, { limit: 10 })).items;
+    expect(userMsg.runDurationMs).toBeNull();
+    expect(mergedMsg.runDurationMs).toBe(192_500);
+    expect(mergedMsg.thinkingMs).toBe(4_000); // model time stays separate
+    expect(activeMsg.runDurationMs).toBeNull();
+    expect(recoveredMsg.runDurationMs).toBeNull();
+  });
+});
+
 describe("listMessages — PENDING message of an ended run", () => {
   it("carries the run's reason once the run has ended, and none while the run is still active", async () => {
     const owner = await user("msg-pending-ended");

@@ -113,7 +113,7 @@ async function toMessageResponse(message: MessageRow, ownerUserId: string, settl
       }),
     attachments: await Promise.all(attachmentsOf(message).map((a) => toAttachmentResponse(a, ownerUserId))),
     thinkingMs: message.thinkingMs,
-    runDurationMs: message.role === "ASSISTANT" ? runDurationMs(message.agentRun) : null,
+    runDurationMs: message.role === "ASSISTANT" ? runDurationMs(message.agentRun, message.status) : null,
     error: messageError(message),
     createdAt: message.createdAt.toISOString(),
   };

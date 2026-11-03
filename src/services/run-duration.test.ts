@@ -20,6 +20,13 @@ describe("runDurationMs (finished turn, admission → completion)", () => {
     expect(runDurationMs({ status, createdAt: at("2026-11-04T10:00:00Z"), completedAt: at("2026-11-04T10:00:05Z") })).toBeNull();
   });
 
+  it("is null when a result was recovered after its run ended (message COMPLETE, run not COMPLETED)", () => {
+    const ended = { status: "FAILED" as const, createdAt: at("2026-11-04T10:00:00Z"), completedAt: at("2026-11-04T10:05:00Z") };
+    expect(runDurationMs(ended, "COMPLETE")).toBeNull();
+    expect(runDurationMs(ended, "PENDING")).toBe(300_000); // the interrupted run's own duration
+    expect(runDurationMs({ ...ended, status: "COMPLETED" }, "COMPLETE")).toBe(300_000);
+  });
+
   it("is null for missing, invalid or out-of-order timestamps", () => {
     expect(runDurationMs(null)).toBeNull();
     expect(runDurationMs({ status: "COMPLETED", createdAt: at("2026-11-04T10:00:00Z"), completedAt: null })).toBeNull();

@@ -1,5 +1,13 @@
 # Magica credit estimation — investigation (Phase 3)
 
+> **Correction (checkpoint 5.1):** the "six-order-of-magnitude
+> inconsistency" below is superseded. All Magica endpoints share one raw
+> integer unit; "÷1,000,000" only produces the "M" display figure (per the
+> balance endpoint's own docs). The numbers recorded here are correct; the
+> interpretation is not. See `CREDIT_ACCOUNTING.md`. The one remaining
+> discrepancy is GPT Image 2's `/pricing` tiers being exactly 1/1.3 of
+> both `estimate-credits` and real `creditUsed`.
+
 **Status: estimate-only calls made, nothing executed.** Every call
 below is `GET .../pricing` (read-only, no body) or `POST
 /v1/nodes/estimate-credits`, which was called only after its own docs
@@ -100,6 +108,9 @@ Exact request body sent:
 | 4 | Merge Videos (empty/design-time form, `transition: fade`) | `50000` | `0.05` credits |
 
 ## A real, unresolved inconsistency found — reported, not papered over
+
+> **Superseded — see the correction at the top and `CREDIT_ACCOUNTING.md`.**
+> Kept unedited below as the historical record of the original reading.
 Comparing the `estimate-credits` numbers above against the `pricing`
 endpoint's own stated figures for the *same* models surfaces a genuine
 discrepancy that this investigation could not resolve from documentation

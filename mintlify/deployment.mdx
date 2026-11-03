@@ -1,0 +1,21 @@
+---
+title: Deployment
+description: Two Vercel projects and a Trigger.dev deployment.
+---
+
+The frontend and backend deploy as **separate Vercel projects**; agent turns and sweeps run on
+**Trigger.dev** (`npx trigger.dev deploy`), not on Vercel. Free plans throughout.
+
+**Backend environment** (names only): `DATABASE_URL`, `DIRECT_DATABASE_URL`, `CLERK_SECRET_KEY`,
+`CLERK_PUBLISHABLE_KEY`, `TRIGGER_SECRET_KEY`, `TRIGGER_PROJECT_REF`, `OPENROUTER_API_KEY`,
+`OPENROUTER_MODEL` (=`openrouter/free`), `MAGICA_API_KEY`, `MAGICA_BASE_URL`, `TRANSLOADIT_KEY`,
+`TRANSLOADIT_SECRET`, `B2_KEY_ID`, `B2_APPLICATION_KEY`, `B2_BUCKET_NAME`, `B2_ENDPOINT`,
+`B2_REGION`, `FRONTEND_ORIGIN`; optional `DATABASE_POOL_MAX` (connections per process, default 10).
+
+**Frontend environment**: `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`,
+`NEXT_PUBLIC_API_URL`.
+
+**Trigger.dev environment**: `DATABASE_URL`, `OPENROUTER_*`, `MAGICA_*`, `B2_*`.
+
+Migrations are additive and applied with `pnpm prisma migrate deploy`. The full runbook is in
+`project-docs/DEPLOYMENT.md` in the backend repository.

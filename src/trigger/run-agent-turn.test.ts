@@ -49,7 +49,12 @@ function toolRequest(calls: ProviderToolCall[], text: string | null = null) {
   return { model: "x/y:free", text, toolCalls: calls, promptTokens: 1, completionTokens: 1 };
 }
 
-beforeEach(() => mockCallOpenRouter.mockReset());
+// Block body: Vitest treats a function returned from beforeEach as a
+// teardown, and mockReset() returns the mock — which would then be *called*
+// after each test (hanging on a test's never-resolving implementation).
+beforeEach(() => {
+  mockCallOpenRouter.mockReset();
+});
 afterAll(() => cleanupTestUsers(createdUserIds));
 
 const skillFixtureTmpDirs: string[] = [];
@@ -323,9 +328,10 @@ describe("executeAgentTurn — tool calling", () => {
     // Checkpoint 3.2: the already-created invocation's own id is now
     // propagated into the execution context — asserted against the
     // real persisted row's id, not just `expect.any(String)`.
+    // Plus the best-effort progress reporter (tool_progress events).
     expect(executeSpy).toHaveBeenCalledWith(
       { timezone: "UTC" },
-      { agentRunId: run.id, userId: owner.id, invocationId: invocation.id },
+      { agentRunId: run.id, userId: owner.id, invocationId: invocation.id, onProgress: expect.any(Function) },
     );
     expect(invocation.status).toBe("COMPLETED");
     expect(invocation.toolName).toBe(FIXTURE_TOOL_NAME);
@@ -998,11 +1004,14 @@ describe("executeAgentTurn — realtime publishing (publish-after-commit)", () =
 
     await executeAgentTurn({ agentRunId: run.id }, undefined, publish);
 
-    expect(seen.map((s) => s.type)).toEqual(["run_status", "assistant_message", "run_status"]);
-    expect(seen[0].agentRunStatus).toBe("RUNNING");
-    expect(seen[1].agentRunStatus).toBe("COMPLETED");
-    expect(seen[1].messageStatus).toBe("COMPLETE");
-    expect(seen[2].agentRunStatus).toBe("COMPLETED");
+    // Progress events (step/thinking_completed) carry no persisted state; the
+    // publish-after-commit guarantee is about state-bearing events.
+    const stateEvents = seen.filter((s) => s.type === "run_status" || s.type === "assistant_message");
+    expect(stateEvents.map((s) => s.type)).toEqual(["run_status", "assistant_message", "run_status"]);
+    expect(stateEvents[0].agentRunStatus).toBe("RUNNING");
+    expect(stateEvents[1].agentRunStatus).toBe("COMPLETED");
+    expect(stateEvents[1].messageStatus).toBe("COMPLETE");
+    expect(stateEvents[2].agentRunStatus).toBe("COMPLETED");
   });
 
   it("publishes tool_started/tool_completed only after the corresponding ToolInvocation write has committed", async () => {

@@ -1,36 +1,50 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Agent Chat — backend
 
-## Getting Started
+REST API and durable agent worker for the Galaxy Agent Chat work trial. Frontend:
+[`agent-chat-frontend`](https://github.com/chetanpatel003/agent-chat-frontend).
 
-First, run the development server:
+**Stack:** Next.js route handlers · TypeScript (strict) · PostgreSQL (Neon) + Prisma 7 · Clerk ·
+Trigger.dev v4 (durable tasks, waitpoints, realtime) · OpenRouter `openrouter/free` (no paid
+fallback) · Magica (Crop Image, GPT Image 2, Merge Videos) · Transloadit Community + Backblaze B2 ·
+Zod · Vitest + MSW.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## What it does
+- Versioned REST API (`/api/v1`): chats, messages, chat-style completions, direct Magica tool runs,
+  run status, plan approvals, media uploads and media library, credits, webhook endpoints.
+- Agent turns run on Trigger.dev: streamed OpenRouter output, bounded tool-calling loop, skills
+  loaded on demand, plan mode with durable waitpoints, stop/interrupt, crash recovery.
+- Magica media tools with credit admission and exactly-once settlement.
+- Signed outbound webhooks (`agent.started`, `agent.completed`, `agent.failed`, `tool.completed`).
+
+Documentation: `mintlify/` (Mintlify site; API reference generated from the Zod contracts with
+`pnpm tsx scripts/generate-openapi.ts`). Engineering notes: `project-docs/`.
+
+## Run locally
+```sh
+cp .env.example .env          # names only in the template; never commit values
+pnpm install
+pnpm prisma migrate deploy
+pnpm dev                      # http://localhost:3001
+pnpm trigger:dev              # worker: agent turns, archival, settlement, webhooks, sweeps
 ```
+Node 22 is required (`nvm use 22`).
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Tests
+```sh
+pnpm vitest run --exclude src/services/send-turn.test.ts   # full suite without the live-dispatch test
+pnpm vitest run src/services/send-turn.test.ts             # live: real dispatch + one OpenRouter Free request
+pnpm tsc --noEmit && pnpm lint && pnpm build
+```
+Tests use a real database and mock every paid or external provider (MSW / injected fakes). The
+one live test file sends a real OpenRouter Free request through the dev worker.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Deployment
+Not deployed yet: the Vercel CLI on the development machine needs the owner's login. The runbook,
+with every environment variable name, is in `project-docs/DEPLOYMENT.md`.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Known limitations
+See `mintlify/limitations.mdx`. Highlights: Merge Videos accepts only uploaded videos with a
+measured duration (5 min combined; 1.3× estimate, charged at actual usage — `project-docs/decisions/0018`),
+not yet confirmed by a live merge; `edit_image`,
+`crop_image` and `merge_videos` verified with fixtures, not live; load tested to 200 concurrent
+admissions/turns with mocked providers (`project-docs/LOAD_TEST.md`), not 1,000.

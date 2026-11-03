@@ -1,3 +1,4 @@
+import type { ToolProgressPhase } from "@/contracts/run-event";
 import type { ZodType } from "zod";
 
 export type ToolExecutionContext = {
@@ -11,6 +12,9 @@ export type ToolExecutionContext = {
    * cannot disambiguate when more than one tool call exists under the
    * same run. */
   invocationId: string;
+  /** Best-effort progress report for the UI (e.g. the provider accepted
+   * the job). Never throws; a tool must not depend on it. */
+  onProgress?: (phase: ToolProgressPhase) => Promise<void>;
 };
 
 /** The two outcomes `reconcile()` can resolve to. A third state —
@@ -21,7 +25,32 @@ export type ToolExecutionContext = {
  * share one signaling convention rather than two. */
 export type ToolReconcileOutcome<TOutput> =
   | { status: "completed"; output: TOutput }
-  | { status: "failed"; errorCode: string; errorMessage: string };
+  | { status: "failed"; errorCode: string; errorMessage: string; creditUsed?: number };
+
+/** A tool failure carrying a specific, user-safe error code; any other
+ * thrown error is recorded as EXECUTION_FAILED, as before. */
+export class ToolExecutionError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ToolExecutionError";
+  }
+}
+
+/** A provider run that ended FAILED/CANCELED. Same message and error
+ * semantics as a plain failure; additionally carries the provider's
+ * reported raw `creditUsed` so it can be persisted and settled. */
+export class ProviderRunFailedError extends Error {
+  constructor(
+    message: string,
+    public readonly creditUsed: number | undefined,
+  ) {
+    super(message);
+    this.name = "ProviderRunFailedError";
+  }
+}
 
 /**
  * One entry in the authoritative tool registry. `inputSchema`/
@@ -46,7 +75,11 @@ export type ToolDefinition<TInput = unknown, TOutput = unknown> = {
    * "still can't tell, leave the invocation RUNNING" — the caller
    * treats every throw this way, never as a crash.
    */
-  reconcile?: (invocation: { id: string; providerRunId: string | null }) => Promise<ToolReconcileOutcome<TOutput>>;
+  reconcile?: (
+    invocation: { id: string; providerRunId: string | null },
+    /** singlePoll: one provider status read, independent of the AgentRun (recovery sweep). */
+    options?: { singlePoll?: boolean },
+  ) => Promise<ToolReconcileOutcome<TOutput>>;
 };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- a registry necessarily holds tools of different input/output shapes; each entry's own generics stay precise where it's looked up and used

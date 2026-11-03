@@ -1,6 +1,8 @@
 import { z } from "zod";
-import type { ToolDefinition } from "./types";
+import { ProviderRunFailedError, type ToolDefinition, type ToolExecutionContext } from "./types";
 import { startMagicaRun } from "@/providers/magica";
+import { admitBillableRun, type AdmissionSpec } from "@/services/credit-admission";
+import { mergeAdmissionCredits, resolveMergeSources } from "@/services/merge-admission";
 import { persistProviderRunId, pollMagicaRunToCompletion, reconcileMagicaRun, durableWait, type DurableWait } from "@/services/magica-run";
 
 /**
@@ -80,15 +82,20 @@ export function createMagicaTool<TInput>(options: {
   nodeType: string;
   subModelId?: string;
   inputSchema: z.ZodType<TInput>;
+  /** Required: every billable tool declares how its cost is checked before running. */
+  /** May look up the caller's own data (e.g. measured video durations); runs before any provider call. */
+  admission: (input: TInput, context: ToolExecutionContext) => AdmissionSpec | Promise<AdmissionSpec>;
   waitFn?: DurableWait;
 }): ToolDefinition<TInput, MagicaToolOutput> {
-  const { name, description, nodeType, subModelId, inputSchema, waitFn = durableWait } = options;
+  const { name, description, nodeType, subModelId, inputSchema, admission, waitFn = durableWait } = options;
   return {
     name,
     description,
     inputSchema,
     outputSchema: MagicaToolOutputSchema,
     async execute(input, context) {
+      // Before any provider call: refuses (coded error) rather than start an unaffordable or unpriced run.
+      await admitBillableRun(context.userId, await admission(input, context));
       const started = await startMagicaRun(nodeType, input as Record<string, unknown>, subModelId);
 
       // Persisted immediately after the 202, before any poll/wait —
@@ -102,18 +109,23 @@ export function createMagicaTool<TInput>(options: {
         );
       }
 
+      // From here the job is Magica's: tell the UI we are waiting for it.
+      // Best-effort: never let a progress report affect a started billable run.
+      await context.onProgress?.("provider_waiting").catch(() => undefined);
+
       const outcome = await pollMagicaRunToCompletion({
         agentRunId: context.agentRunId,
         providerRunId: started.runId,
         waitFn,
       });
       if (outcome.status === "failed") {
-        throw new Error(outcome.errorMessage);
+        // Same message/semantics as before; also carries Magica's reported usage.
+        throw new ProviderRunFailedError(outcome.errorMessage, outcome.creditUsed);
       }
       return normalizeMagicaOutput(outcome.output, outcome.creditUsed);
     },
-    async reconcile(invocation) {
-      const outcome = await reconcileMagicaRun(invocation, waitFn);
+    async reconcile(invocation, options) {
+      const outcome = await reconcileMagicaRun(invocation, waitFn, options);
       if (outcome.status === "completed") {
         return { status: "completed" as const, output: normalizeMagicaOutput(outcome.output, outcome.creditUsed) };
       }
@@ -167,6 +179,34 @@ export const PublicHttpsUrlSchema = z
   .url()
   .refine((u) => u.startsWith("https://"), { message: "must be a public HTTPS URL" });
 
+// ---------- Admission policies (see project-docs/magica/CREDIT_ACCOUNTING.md) ----------
+
+/** Crop Image is a documented flat price; `/pricing` (fixed, 5000) and
+ * `estimate-credits` (5000) agree, so no estimate call is needed. */
+export const CROP_IMAGE_CREDITS = BigInt(5000);
+
+/** GPT Image 2: Magica's own estimate, only for an explicit size. Size
+ * "Auto" (or omitted, which defaults to Auto) is priced from the actual
+ * output and cannot be estimated, so it is refused with guidance. The
+ * estimate body mirrors the one previously verified to succeed; media
+ * (uploadedImages) is never sent — it does not affect GPT Image 2 pricing. */
+function gptImage2Admission(subModelId: string) {
+  return (input: { prompt: string; size?: unknown; quality?: string; n?: number }): AdmissionSpec => {
+    if (input.size === undefined || input.size === "Auto") {
+      return {
+        kind: "blocked",
+        code: "EXPLICIT_SIZE_REQUIRED",
+        message:
+          'The cost of size "Auto" cannot be estimated before running. Retry with an explicit size such as "1024x1024".',
+      };
+    }
+    const data: Record<string, unknown> = { prompt: input.prompt, size: input.size };
+    if (input.quality !== undefined) data.quality = input.quality;
+    if (input.n !== undefined) data.n = input.n;
+    return { kind: "estimate", node: { type: "gpt_image_2", subModelId, data } };
+  };
+}
+
 // ---------- generate_image (GPT Image 2, text-to-image) ----------
 
 const GenerateImageInputSchema = z.object({
@@ -182,6 +222,7 @@ export const generateImageTool: ToolDefinition<z.infer<typeof GenerateImageInput
     nodeType: "gpt_image_2",
     subModelId: "gpt-image-2-text",
     inputSchema: GenerateImageInputSchema,
+    admission: gptImage2Admission("gpt-image-2-text"),
   });
 
 // ---------- edit_image (GPT Image 2, image editing) ----------
@@ -207,6 +248,7 @@ export const editImageTool: ToolDefinition<z.infer<typeof EditImageInputSchema>,
     nodeType: "gpt_image_2",
     subModelId: "gpt-image-2-edit",
     inputSchema: EditImageInputSchema,
+    admission: gptImage2Admission("gpt-image-2-edit"),
   },
 );
 
@@ -235,6 +277,7 @@ export const cropImageTool: ToolDefinition<z.infer<typeof CropImageInputSchema>,
       "Crop an existing single image to a specific rectangular region, by percentage of the original or exact pixel coordinates — a purely geometric crop, no AI modification of pixel content.",
     nodeType: "crop_image",
     inputSchema: CropImageInputSchema,
+    admission: () => ({ kind: "fixed", credits: CROP_IMAGE_CREDITS }),
   },
 );
 
@@ -254,7 +297,15 @@ export const mergeVideosTool: ToolDefinition<z.infer<typeof MergeVideosInputSche
   createMagicaTool({
     name: "merge_videos",
     description:
-      "Combine 2 to 100 existing videos into a single video, in the given order, with an optional transition between clips.",
+      "Combine 2 to 100 of the user's own uploaded videos (5 minutes combined at most) into a single video, in the given order, with an optional transition between clips. Pass the video URLs exactly as listed under the user's attached files; generated videos and external links are not accepted.",
     nodeType: "merge_videos",
     inputSchema: MergeVideosInputSchema,
+    // Decision 0018: priced from the server-measured durations of the user's
+    // own uploads (no duration exists in Magica's input); settlement still
+    // charges Magica's reported creditUsed.
+    admission: async (input, context) => {
+      const sources = await resolveMergeSources(context.userId, input.video_urls);
+      const { required } = mergeAdmissionCredits(sources.videoCount, sources.totalSeconds);
+      return { kind: "fixed", credits: required };
+    },
   });

@@ -1,0 +1,22 @@
+---
+title: Plan mode and approvals
+description: Durable human waitpoints with exactly-once resume.
+---
+
+Send a message with `planMode: true`: the agent proposes a plan without tools, then the run waits
+(`WAITING`, `waitingReason: PLAN`) on a **waitpoint** for up to 24 hours. Nothing runs while it
+waits.
+
+```sh
+GET  /api/v1/chats/{chatId}/runs/{runId}/waitpoints
+POST /api/v1/chats/{chatId}/runs/{runId}/waitpoints/{waitpointId}/resolve
+     {"decision":"approve","note":"keep it short"}   # or {"decision":"reject"}
+```
+
+- **Exactly once.** The decision is saved first (first decision wins; duplicates get the same
+  answer), then the Trigger.dev token is completed only if it is still waiting. If completing it
+  fails you get `503`; repeat the request — the same token is completed, never a new one.
+- **Approve** continues the same run with the plan; **reject** completes the turn with the plan.
+- **Expired** after 24 h: the run stops (`WAITPOINT_EXPIRED`), the plan is kept.
+- **Execution gone** (e.g. the worker was cancelled): the decision is refused with `409`, the run
+  ends as `RUN_INTERRUPTED`. If its state can't be confirmed: `503`, nothing changes.

@@ -1,0 +1,20 @@
+---
+title: Errors
+description: One error envelope, safe messages.
+---
+
+Success: `{ "ok": true, "data": … }`. Failure: `{ "ok": false, "error": { "code", "message" } }`.
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `ValidationError` | Invalid body, query or state (e.g. unfinished upload). Field-level messages. |
+| 401 | `UnauthorizedError` | Missing or invalid token. |
+| 404 | `NotFoundError` | Missing **or not yours** (never leaked). |
+| 409 | `ConflictError` | A run is already active, a key was reused, an approval expired. |
+| 409 | `RunInterruptedError` | A decision arrived after the run's execution ended. |
+| 503 | `WaitpointResumeError`, `ExecutionStatusUnavailableError` | Retryable; nothing was lost. |
+| 500 | `InternalError` | Unexpected; no internal detail is returned. |
+
+Failed runs carry a user-safe reason on the run (`errorCode`, `errorMessage`) and on the assistant
+message (`error`): e.g. `STREAM_INTERRUPTED`, `RATE_LIMITED`, `TURN_LIMIT_EXCEEDED`,
+`CANCELLED_BY_USER`, `INTERRUPTED_BY_USER`, `WAITPOINT_EXPIRED`, `RUN_INTERRUPTED`.

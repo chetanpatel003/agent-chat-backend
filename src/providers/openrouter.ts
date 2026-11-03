@@ -64,6 +64,8 @@ export class OpenRouterDefiniteError extends Error {
   constructor(
     message: string,
     public readonly code: string,
+    /** Visible text already streamed before a mid-stream failure (preserved, never retried). */
+    public readonly partialText: string | null = null,
   ) {
     super(message);
     this.name = "OpenRouterDefiniteError";
@@ -138,6 +140,17 @@ function errorCodeForStatus(status: number): string {
   return "PROVIDER_ERROR";
 }
 
+export type CallOpenRouterOptions = {
+  /** Streams the response (`stream: true`) and receives each visible text
+   * delta, in order, after the routed model is verified free. Reasoning
+   * deltas are never forwarded. An error thrown here aborts the stream and
+   * propagates unchanged (e.g. the run was cancelled). */
+  onTextDelta?: (delta: string) => void | Promise<void>;
+};
+
+/** Between streamed chunks; a stalled stream is a failure, not a hang. */
+const STREAM_IDLE_TIMEOUT_MS = 60_000;
+
 /**
  * Calls OpenRouter's free route for one chat turn. Throws
  * OpenRouterDefiniteError for any outcome we can finalize immediately
@@ -154,6 +167,7 @@ function errorCodeForStatus(status: number): string {
 export async function callOpenRouter(
   messages: ProviderMessage[],
   tools: OpenRouterToolSpec[] = [],
+  options: CallOpenRouterOptions = {},
 ): Promise<OpenRouterTurnResult> {
   const configuredModel = process.env.OPENROUTER_MODEL;
   if (configuredModel !== REQUIRED_MODEL) {
@@ -174,7 +188,7 @@ export async function callOpenRouter(
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   let response: Response;
   try {
@@ -189,6 +203,7 @@ export async function callOpenRouter(
         messages,
         max_completion_tokens: MAX_COMPLETION_TOKENS,
         ...(tools.length > 0 ? { tools } : {}),
+        ...(options.onTextDelta ? { stream: true } : {}),
       }),
       signal: controller.signal,
     });
@@ -202,6 +217,19 @@ export async function callOpenRouter(
     );
   } finally {
     clearTimeout(timeout);
+  }
+
+  if (options.onTextDelta && response.ok) {
+    timeout = setTimeout(() => controller.abort(), STREAM_IDLE_TIMEOUT_MS);
+    try {
+      return await readStreamedTurn(response, options.onTextDelta, () => {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => controller.abort(), STREAM_IDLE_TIMEOUT_MS);
+      });
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+    }
   }
 
   // Any HTTP response at all — success or error — is a definitive,
@@ -256,4 +284,169 @@ export async function callOpenRouter(
     promptTokens: usage.prompt_tokens,
     completionTokens: usage.completion_tokens,
   };
+}
+
+// ---------- Streaming (SSE) ----------
+// OpenAI-compatible chunks: `data: {json}` lines, `: comment` keep-alives,
+// a final `data: [DONE]`. Tool calls arrive as deltas keyed by `index`
+// (id/name once, arguments concatenated). The final chunk carries usage.
+// A mid-stream `error` object is a provider error delivered after HTTP 200.
+
+const StreamToolCallDeltaSchema = z.object({
+  index: z.number().int().nonnegative(),
+  id: z.string().optional(),
+  type: z.literal("function").optional(),
+  function: z.object({ name: z.string().optional(), arguments: z.string().optional() }).optional(),
+});
+
+const StreamChunkSchema = z.object({
+  model: z.string().optional(),
+  choices: z
+    .array(
+      z.object({
+        delta: z
+          .object({
+            content: z.string().nullish(),
+            tool_calls: z.array(StreamToolCallDeltaSchema).nullish(),
+          })
+          .optional(),
+      }),
+    )
+    .optional(),
+  usage: UsageSchema.nullish(),
+  error: z.object({ code: z.union([z.number(), z.string()]).optional(), message: z.string() }).optional(),
+});
+
+/** Splits a byte stream into SSE `data:` payloads (comments and blank lines dropped). */
+async function* sseData(body: ReadableStream<Uint8Array>, onActivity: () => void): AsyncGenerator<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      onActivity();
+      buffer += decoder.decode(value, { stream: true });
+      let newline: number;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (line.startsWith("data:")) yield line.slice(5).trim();
+      }
+    }
+    const last = buffer.trim();
+    if (last.startsWith("data:")) yield last.slice(5).trim();
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function readStreamedTurn(
+  response: Response,
+  onTextDelta: (delta: string) => void | Promise<void>,
+  onActivity: () => void,
+): Promise<OpenRouterTurnResult> {
+  if (!response.body) {
+    throw new OpenRouterDefiniteError("OpenRouter returned an empty stream", "EMPTY_RESPONSE");
+  }
+  let model: string | null = null;
+  let text = "";
+  let usage: z.infer<typeof UsageSchema> | null = null;
+  const calls = new Map<number, { id?: string; name: string; arguments: string }>();
+  function fail(message: string, code: string): never {
+    throw new OpenRouterDefiniteError(message, code, text.trim() || null);
+  }
+  // An error thrown by the caller's own callback is passed through unchanged.
+  let callbackError: { error: unknown } | null = null;
+  let sawDone = false;
+
+  try {
+    for await (const data of sseData(response.body, onActivity)) {
+      if (data === "[DONE]") {
+        sawDone = true;
+        break;
+      }
+      let json: unknown;
+      try {
+        json = JSON.parse(data);
+      } catch {
+        fail("OpenRouter streamed a chunk that wasn't valid JSON", "MALFORMED_RESPONSE");
+      }
+      const parsed = StreamChunkSchema.safeParse(json);
+      if (!parsed.success) fail("OpenRouter streamed a chunk that didn't match the expected shape", "MALFORMED_RESPONSE");
+      const chunk = parsed.data;
+      if (chunk.error) fail(chunk.error.message, "PROVIDER_ERROR");
+
+      if (chunk.model) {
+        // Verified before any text is forwarded: a non-free route's output is never shown.
+        if (!chunk.model.endsWith(FREE_MODEL_SUFFIX)) {
+          fail(`Provider routed to a non-free model (${chunk.model}); refusing to use the result`, "NON_FREE_ROUTE");
+        }
+        model = chunk.model;
+      }
+      if (chunk.usage) usage = chunk.usage;
+
+      const delta = chunk.choices?.[0]?.delta;
+      for (const call of delta?.tool_calls ?? []) {
+        const entry = calls.get(call.index) ?? { name: "", arguments: "" };
+        if (call.id) entry.id = call.id;
+        if (call.function?.name) entry.name += call.function.name;
+        if (call.function?.arguments) entry.arguments += call.function.arguments;
+        calls.set(call.index, entry);
+      }
+      if (delta?.content) {
+        if (!model) fail("OpenRouter streamed text before identifying the routed model", "MALFORMED_RESPONSE");
+        text += delta.content;
+        try {
+          await onTextDelta(delta.content);
+        } catch (error) {
+          callbackError = { error };
+          throw error;
+        }
+      }
+    }
+  } catch (error) {
+    if (callbackError || error instanceof OpenRouterDefiniteError) throw error;
+    // Our idle timeout or a dropped connection after HTTP 200: the request
+    // was received and is known to have failed part-way. Free route, no side
+    // effects; the partial text is preserved by the caller, never retried.
+    if (isTransportError(error)) {
+      fail("The OpenRouter stream was interrupted before it finished", "STREAM_INTERRUPTED");
+    }
+    throw error; // e.g. onTextDelta's own error (run cancelled) — unchanged
+  }
+  // OpenRouter always terminates a complete stream with [DONE]; without it
+  // the body was cut off (a dropped connection can also end "cleanly").
+  if (!sawDone) fail("The OpenRouter stream ended before it finished", "STREAM_INTERRUPTED");
+
+  if (!model) return fail("OpenRouter's stream never identified the routed model", "MALFORMED_RESPONSE");
+
+  const toolCalls: ProviderToolCall[] = [];
+  for (const [, call] of [...calls.entries()].sort(([a], [b]) => a - b)) {
+    const parsed = ToolCallSchema.safeParse({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } });
+    if (!parsed.success) fail("OpenRouter streamed an incomplete tool call", "MALFORMED_RESPONSE");
+    toolCalls.push(parsed.data);
+  }
+  if (new Set(toolCalls.map((c) => c.id)).size !== toolCalls.length) {
+    fail("Duplicate tool_call id in provider response", "MALFORMED_RESPONSE");
+  }
+
+  const trimmed = text.trim() || null;
+  if (!trimmed && toolCalls.length === 0) {
+    throw new OpenRouterDefiniteError("OpenRouter returned an empty response", "EMPTY_RESPONSE");
+  }
+  return {
+    model,
+    text: trimmed,
+    toolCalls: toolCalls.length ? toolCalls : null,
+    promptTokens: usage?.prompt_tokens ?? 0,
+    completionTokens: usage?.completion_tokens ?? 0,
+  };
+}
+
+/** Errors raised by the body reader itself (abort, reset), not by our own code. */
+function isTransportError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === "AbortError" || error.name === "TypeError" || /terminated|aborted|socket|ECONNRESET/i.test(error.message);
 }

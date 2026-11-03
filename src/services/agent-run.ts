@@ -1,10 +1,10 @@
 import { runs, auth } from "@trigger.dev/sdk";
 import { prisma } from "@/lib/prisma";
 import { requireChatOwnership, requireAgentRunOwnership } from "@/services/ownership";
-import { ACTIVE_RUN_STATUSES, SkippedTransition } from "@/services/run-transitions";
+import { ACTIVE_RUN_STATUSES, RUN_TRANSITION_TRANSACTION_OPTIONS, SkippedTransition } from "@/services/run-transitions";
 import { NotFoundError, ValidationError } from "@/lib/errors";
 import type { AgentRunResponse, RealtimeTokenResponse } from "@/contracts/agent-run";
-import type { AgentRun } from "@/generated/prisma/client";
+import type { AgentRun, Prisma } from "@/generated/prisma/client";
 import type { AgentRunStatus } from "@/generated/prisma/enums";
 
 const TERMINAL_RUN_STATUSES: AgentRunStatus[] = ["COMPLETED", "FAILED", "CANCELLED"];
@@ -19,6 +19,7 @@ function toAgentRunResponse(run: AgentRun): AgentRunResponse {
     promptTokens: run.promptTokens,
     completionTokens: run.completionTokens,
     turnCount: run.turnCount,
+    planMode: run.planMode,
     errorCode: run.errorCode,
     errorMessage: run.errorMessage,
     startedAt: run.startedAt?.toISOString() ?? null,
@@ -41,6 +42,14 @@ export async function getActiveRun(
     where: { chatId, status: { in: ACTIVE_RUN_STATUSES } },
   });
   return run ? toAgentRunResponse(run) : null;
+}
+
+/** One run of this chat, in any state. Another user's (or chat's) run is a 404. */
+export async function getRun(userId: string, chatId: string, agentRunId: string): Promise<AgentRunResponse> {
+  await requireChatOwnership(userId, chatId);
+  const run = await requireAgentRunOwnership(userId, agentRunId);
+  if (run.chatId !== chatId) throw new NotFoundError("Agent run not found");
+  return toAgentRunResponse(run);
 }
 
 /**
@@ -71,36 +80,60 @@ export async function getRealtimeToken(
   return { token };
 }
 
+export const CANCELLED_BY_USER = "CANCELLED_BY_USER";
+export const INTERRUPTED_BY_USER = "INTERRUPTED_BY_USER";
+
 /**
- * Cancellation transaction: CAS the AgentRun from an active status to
- * CANCELLED, and — in the same transaction — move its PENDING assistant
- * message (if any) to CANCELLED too, *without touching its content* so
- * whatever was already persisted (prior tool_use/tool_result blocks)
- * survives exactly as it was. Guarded the same way every other terminal
- * write in the worker is guarded (run-transitions.ts): if the AgentRun
- * is no longer active by the time this runs (a worker or a second
- * cancel request already finalized it), the whole transaction aborts
- * and nothing is written — never a race where the message gets
- * cancelled but the run doesn't, or vice versa.
+ * Cancellation inside a caller's transaction: CAS the AgentRun from an
+ * active status to CANCELLED, move its PENDING assistant message to
+ * CANCELLED *without touching its content* (persisted text, tool blocks
+ * and streamed partial text survive), and cancel any open waitpoint so a
+ * late decision can't resume it. Returns false (nothing written) when the
+ * run is no longer active — a worker or another cancel already finalized it.
+ * Used by Stop (cancelRun) and by Interrupt (send-turn's admission).
  */
+export async function cancelActiveRunInTx(
+  tx: Prisma.TransactionClient,
+  agentRunId: string,
+  errorCode: typeof CANCELLED_BY_USER | typeof INTERRUPTED_BY_USER,
+): Promise<boolean> {
+  const run = await tx.agentRun.updateMany({
+    where: { id: agentRunId, status: { in: ACTIVE_RUN_STATUSES } },
+    data: { status: "CANCELLED", completedAt: new Date(), errorCode, waitingReason: null },
+  });
+  if (run.count === 0) return false;
+  await tx.message.updateMany({
+    where: { agentRunId, role: "ASSISTANT", status: "PENDING" },
+    data: { status: "CANCELLED" },
+  });
+  await tx.waitpoint.updateMany({ where: { agentRunId, status: "PENDING" }, data: { status: "CANCELLED" } });
+  return true;
+}
+
 async function applyCancellation(agentRunId: string): Promise<{ applied: boolean }> {
   try {
     await prisma.$transaction(async (tx) => {
-      const run = await tx.agentRun.updateMany({
-        where: { id: agentRunId, status: { in: ACTIVE_RUN_STATUSES } },
-        data: { status: "CANCELLED", completedAt: new Date(), errorCode: "CANCELLED_BY_USER" },
-      });
-      if (run.count === 0) throw new SkippedTransition();
-
-      await tx.message.updateMany({
-        where: { agentRunId, role: "ASSISTANT", status: "PENDING" },
-        data: { status: "CANCELLED" },
-      });
-    });
+      if (!(await cancelActiveRunInTx(tx, agentRunId, CANCELLED_BY_USER))) throw new SkippedTransition();
+    }, RUN_TRANSITION_TRANSACTION_OPTIONS);
     return { applied: true };
   } catch (error) {
     if (error instanceof SkippedTransition) return { applied: false };
     throw error;
+  }
+}
+
+/** Best-effort: PostgreSQL is already authoritative; the worker's guarded
+ * checks stop it regardless of whether this call succeeds. */
+export async function cancelTriggerRunBestEffort(triggerRunId: string | null, log: Record<string, unknown>) {
+  if (!triggerRunId) return;
+  try {
+    await runs.cancel(triggerRunId);
+  } catch (error) {
+    console.error("Trigger.dev run cancellation failed", {
+      ...log,
+      triggerRunId,
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 
@@ -134,22 +167,7 @@ export async function cancelRun(
   const { applied } = await applyCancellation(agentRunId);
   const updated = await prisma.agentRun.findUniqueOrThrow({ where: { id: agentRunId } });
 
-  // Best-effort: PostgreSQL is already authoritative for the
-  // application-level outcome by this point. A Trigger.dev run that's
-  // mid-call will be caught by the worker's own guarded status checks
-  // the moment it comes back, regardless of whether this call succeeds.
-  if (applied && updated.triggerRunId) {
-    try {
-      await runs.cancel(updated.triggerRunId);
-    } catch (error) {
-      console.error("Trigger.dev run cancellation failed", {
-        agentRunId,
-        chatId,
-        triggerRunId: updated.triggerRunId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
+  if (applied) await cancelTriggerRunBestEffort(updated.triggerRunId, { agentRunId, chatId });
 
   return toAgentRunResponse(updated);
 }

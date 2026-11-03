@@ -8,11 +8,22 @@ import {
   OpenRouterDefiniteError,
   type ProviderMessage,
   type ProviderToolCall,
+  type OpenRouterToolSpec,
   type OpenRouterTurnResult,
 } from "@/providers/openrouter";
+import { openTriggerTextStream, type OpenTextStream, type TextStreamSink } from "@/realtime/text-stream";
+import {
+  awaitWaitpoint,
+  triggerWaitpointRuntime,
+  WAITPOINT_EXPIRED_CODE,
+  type WaitpointRuntime,
+} from "@/services/waitpoint";
+import type { PlanResolution } from "@/contracts/waitpoint";
+import { createWebhookNotifier, type WebhookDispatcher, type WebhookNotifier } from "@/services/webhooks";
+import { dispatchWebhook } from "./deliver-webhook";
 import { buildConversationContext } from "@/providers/conversation-context";
 import { PRODUCTION_TOOL_REGISTRY, toOpenRouterTools } from "@/tools/registry";
-import type { ToolRegistry } from "@/tools/types";
+import { ProviderRunFailedError, ToolExecutionError, type ToolRegistry } from "@/tools/types";
 import type { ContentBlock } from "@/contracts/message";
 import { MagicaPollInconclusiveError } from "@/providers/magica";
 import { PRODUCTION_SKILL_REGISTRY, listSkillMetadata } from "@/skills/registry";
@@ -24,17 +35,45 @@ import {
   isAgentRunRecentlyActive,
   readAgentRunStatus,
   SkippedTransition,
+  RUN_TRANSITION_TRANSACTION_OPTIONS,
+  isRetryOfOwningRun,
   type GuardedTransitionResult,
+  type TurnExecution,
 } from "@/services/run-transitions";
 import {
   publishRunEvent,
   createRunEventEmitter,
+  lastPublishedSeq,
   type PublishRunEvent,
   type EmitRunEvent,
 } from "@/realtime/publish-run-event";
+import { archiveRunGeneratedAssets, isGeneratedMediaTool } from "@/services/generated-assets";
+import { dispatchGeneratedAssetArchival } from "./archive-generated-assets";
+import { isBillableTool, settleRunCredits, settleToolInvocationCreditsSafely } from "@/services/credit-settlement";
+import { dispatchCreditSettlement } from "./settle-tool-credits";
+import { persistReconciledOutcome } from "@/services/tool-reconciliation";
 
 export type RunAgentTurnPayload = {
   agentRunId: string;
+  /** A direct tool run (REST tool execution): one validated call, no model. */
+  directTool?: { name: string; input: Record<string, unknown> };
+};
+
+/** What a finished turn records about model usage (all null for a direct tool run). */
+type TurnUsage = { model: string | null; promptTokens: number | null; completionTokens: number | null };
+const NO_MODEL_USAGE: TurnUsage = { model: null, promptTokens: null, completionTokens: null };
+
+/** Trigger.dev-only capabilities, injected so tests run in-process. */
+export type TurnRuntime = {
+  openTextStream: OpenTextStream;
+  waitpoints: WaitpointRuntime;
+  /** Outbound lifecycle webhooks; defaults to the durable delivery task. */
+  webhooks?: WebhookDispatcher;
+};
+
+const PRODUCTION_TURN_RUNTIME: TurnRuntime = {
+  openTextStream: openTriggerTextStream,
+  waitpoints: triggerWaitpointRuntime,
 };
 
 const TERMINAL_STATUSES: AgentRunStatus[] = ["COMPLETED", "FAILED", "CANCELLED"];
@@ -98,6 +137,7 @@ async function markDefiniteFailure(
   errorCode: string,
   errorMessage: string,
   content?: ContentBlock[],
+  thinkingMs?: number,
 ): Promise<GuardedTransitionResult> {
   try {
     await prisma.$transaction(async (tx) => {
@@ -106,6 +146,7 @@ async function markDefiniteFailure(
         data: {
           status: "FAILED",
           ...(content ? { content: content as Prisma.InputJsonValue } : {}),
+          ...(thinkingMs !== undefined ? { thinkingMs } : {}),
         },
       });
       if (message.count === 0) throw new SkippedTransition();
@@ -115,7 +156,7 @@ async function markDefiniteFailure(
         data: { status: "FAILED", errorCode, errorMessage, completedAt: new Date() },
       });
       if (run.count === 0) throw new SkippedTransition();
-    });
+    }, RUN_TRANSITION_TRANSACTION_OPTIONS);
     return { applied: true };
   } catch (error) {
     if (error instanceof SkippedTransition) {
@@ -132,8 +173,9 @@ async function definiteFailureOutcome(
   errorMessage: string,
   content: ContentBlock[],
   emit: EmitRunEvent,
+  thinkingMs?: number,
 ) {
-  const marked = await markDefiniteFailure(agentRunId, pendingMessageId, errorCode, errorMessage, content);
+  const marked = await markDefiniteFailure(agentRunId, pendingMessageId, errorCode, errorMessage, content, thinkingMs);
   if (!marked.applied) {
     return { status: marked.currentStatus, skipped: true as const, ambiguous: false as const };
   }
@@ -150,13 +192,18 @@ async function finalizeSuccess(
   pendingMessageId: string,
   chatId: string,
   content: ContentBlock[],
-  result: OpenRouterTurnResult,
+  result: TurnUsage,
+  thinkingMs?: number,
 ): Promise<GuardedTransitionResult> {
   try {
     await prisma.$transaction(async (tx) => {
       const message = await tx.message.updateMany({
         where: { id: pendingMessageId, status: "PENDING" },
-        data: { status: "COMPLETE", content: content as Prisma.InputJsonValue },
+        data: {
+          status: "COMPLETE",
+          content: content as Prisma.InputJsonValue,
+          ...(thinkingMs !== undefined ? { thinkingMs } : {}),
+        },
       });
       if (message.count === 0) throw new SkippedTransition();
 
@@ -173,7 +220,7 @@ async function finalizeSuccess(
         },
       });
       if (run.count === 0) throw new SkippedTransition();
-    });
+    }, RUN_TRANSITION_TRANSACTION_OPTIONS);
     return { applied: true };
   } catch (error) {
     if (error instanceof SkippedTransition) {
@@ -188,10 +235,11 @@ async function successOutcome(
   pendingMessageId: string,
   chatId: string,
   content: ContentBlock[],
-  result: OpenRouterTurnResult,
+  result: TurnUsage,
   emit: EmitRunEvent,
+  thinkingMs?: number,
 ) {
-  const finalized = await finalizeSuccess(agentRunId, pendingMessageId, chatId, content, result);
+  const finalized = await finalizeSuccess(agentRunId, pendingMessageId, chatId, content, result, thinkingMs);
   if (!finalized.applied) {
     return { status: finalized.currentStatus, skipped: true as const, ambiguous: false as const };
   }
@@ -285,8 +333,10 @@ async function runOneToolCall(params: {
   userId: string;
   messageId: string;
   emit: EmitRunEvent;
+  /** After a successful tool's terminal write (webhooks). */
+  onCompleted?: (toolInvocationId: string, toolName: string) => Promise<void>;
 }): Promise<ToolCallOutcome> {
-  const { toolCall, registry, agentRunId, userId, messageId, emit } = params;
+  const { toolCall, registry, agentRunId, userId, messageId, emit, onCompleted } = params;
   const idempotencyKey = `${agentRunId}:${toolCall.id}`;
 
   let rawInput: unknown;
@@ -407,9 +457,25 @@ async function runOneToolCall(params: {
   // let Trigger.dev's retry policy + the re-entry/ambiguous-outcome
   // mechanism handle it").
   const startedAt = Date.now();
-  let outcome: { ok: true; output: unknown } | { ok: false; errorCode: string; errorMessage: string };
+  let outcome:
+    | { ok: true; output: unknown }
+    | { ok: false; errorCode: string; errorMessage: string; creditUsed?: number };
   try {
-    const rawOutput = await tool.execute(parsedInput.data, { agentRunId, userId, invocationId: invocation.id });
+    const rawOutput = await tool.execute(parsedInput.data, {
+      agentRunId,
+      userId,
+      invocationId: invocation.id,
+      // Best-effort UI progress: a failed publish must never fail (or
+      // make ambiguous) a provider run that has already started.
+      onProgress: (phase) =>
+        emit({ type: "tool_progress", toolInvocationId: invocation.id, toolName: tool.name, phase }).catch((error: unknown) => {
+          console.warn("tool_progress publish failed", {
+            agentRunId,
+            toolInvocationId: invocation.id,
+            error: error instanceof Error ? error.name : "UnknownError",
+          });
+        }),
+    });
     const parsedOutput = tool.outputSchema.safeParse(rawOutput);
     outcome = parsedOutput.success
       ? { ok: true, output: parsedOutput.data }
@@ -429,8 +495,10 @@ async function runOneToolCall(params: {
     if (error instanceof MagicaPollInconclusiveError) throw error;
     outcome = {
       ok: false,
-      errorCode: "EXECUTION_FAILED",
+      // A coded tool error (e.g. INSUFFICIENT_CREDITS) keeps its code; anything else is EXECUTION_FAILED as before.
+      errorCode: error instanceof ToolExecutionError ? error.code : "EXECUTION_FAILED",
       errorMessage: error instanceof Error ? error.message : "Tool execution failed",
+      creditUsed: error instanceof ProviderRunFailedError ? error.creditUsed : undefined,
     };
   }
   const durationMs = Date.now() - startedAt;
@@ -441,12 +509,30 @@ async function runOneToolCall(params: {
       data: { status: "COMPLETED", output: outcome.output as Prisma.InputJsonValue, durationMs },
     });
     await emit({ type: "tool_completed", toolInvocationId: completed.id, toolName: tool.name, durationMs });
-    return buildToolCallOutcome(completed, toolCall, rawInput, outcome.output as Record<string, unknown>, null);
+    await onCompleted?.(completed.id, tool.name);
+    // After the provider outcome is durable: archival runs as its own
+    // retried Trigger.dev task, independent of this run's liveness. Never
+    // throws, never changes the invocation's outcome.
+    if (isGeneratedMediaTool(tool.name)) await dispatchGeneratedAssetArchival(completed.id);
+    return buildToolCallOutcome(
+      await settledInvocation(completed),
+      toolCall,
+      rawInput,
+      outcome.output as Record<string, unknown>,
+      null,
+    );
   }
 
   const failed = await prisma.toolInvocation.update({
     where: { id: invocation.id },
-    data: { status: "FAILED", errorCode: outcome.errorCode, errorMessage: outcome.errorMessage, durationMs },
+    data: {
+      status: "FAILED",
+      errorCode: outcome.errorCode,
+      errorMessage: outcome.errorMessage,
+      durationMs,
+      // A failed/cancelled provider run may still have been charged: keep the reported raw usage.
+      ...(outcome.creditUsed !== undefined ? { output: { creditUsed: outcome.creditUsed } } : {}),
+    },
   });
   await emit({
     type: "tool_failed",
@@ -455,10 +541,28 @@ async function runOneToolCall(params: {
     durationMs,
     errorCode: outcome.errorCode,
   });
-  return buildToolCallOutcome(failed, toolCall, rawInput, null, {
+  return buildToolCallOutcome(await settledInvocation(failed), toolCall, rawInput, null, {
     code: outcome.errorCode,
     message: outcome.errorMessage,
   });
+}
+
+/** Settles a terminal invocation's provider usage (no-op for non-billable
+ * tools, e.g. skills; OpenRouter is never billed) and returns the row with
+ * its creditsCharged. Settlement failure never changes the tool outcome;
+ * run recovery retries it. */
+async function settledInvocation<T extends { id: string; toolName: string; creditsCharged: bigint | null }>(
+  invocation: T,
+): Promise<T> {
+  // Non-billable tools (skills, fixtures) never touch the credit tables or the DB here.
+  if (!isBillableTool(invocation.toolName)) return invocation;
+  // Durable first (idempotent, retried, independent of this run's state), so a
+  // crash or DB error after the terminal write cannot lose the charge; then an
+  // inline attempt so the tool_result block can carry creditsCharged.
+  await dispatchCreditSettlement(invocation.id);
+  const result = await settleToolInvocationCreditsSafely(invocation.id);
+  if (result?.status !== "settled") return invocation;
+  return { ...invocation, creditsCharged: result.charged };
 }
 
 /**
@@ -535,11 +639,41 @@ export async function executeAgentTurn(
   registry: ToolRegistry = PRODUCTION_TOOL_REGISTRY,
   publish: PublishRunEvent = publishRunEvent,
   skillRegistry: SkillRegistry = PRODUCTION_SKILL_REGISTRY,
-) {
+  runtime: TurnRuntime = PRODUCTION_TURN_RUNTIME,
+  execution?: TurnExecution,
+): Promise<TurnResult> {
+  const hooks: TurnHooks = { notify: null };
+  const result = await runAgentTurnOnce(payload, registry, publish, skillRegistry, runtime, execution, hooks);
+  // Terminal outcomes this execution decided (never a skipped/backed-off one).
+  if (hooks.notify && !result.skipped && (result.status === "COMPLETED" || result.status === "FAILED")) {
+    const { errorCode } = await prisma.agentRun.findUniqueOrThrow({
+      where: { id: payload.agentRunId },
+      select: { errorCode: true },
+    });
+    await hooks.notify(result.status === "COMPLETED" ? "agent.completed" : "agent.failed", {
+      status: result.status,
+      errorCode,
+    });
+  }
+  return result;
+}
+
+/** Per-execution hooks set once the run is loaded. */
+type TurnHooks = { notify: WebhookNotifier | null };
+
+async function runAgentTurnOnce(
+  payload: RunAgentTurnPayload,
+  registry: ToolRegistry,
+  publish: PublishRunEvent,
+  skillRegistry: SkillRegistry,
+  runtime: TurnRuntime,
+  execution: TurnExecution | undefined,
+  hooks: TurnHooks,
+): Promise<TurnResult> {
   const run = await prisma.agentRun.findUniqueOrThrow({
     where: { id: payload.agentRunId },
   });
-  const emit = createRunEventEmitter(run.id, publish);
+  const emit = createRunEventEmitter(run.id, publish, lastPublishedSeq(run.id));
 
   // Terminal states are never reopened — this check runs before
   // anything else, so a late-arriving duplicate invocation (a Trigger.dev
@@ -549,6 +683,7 @@ export async function executeAgentTurn(
   if (TERMINAL_STATUSES.includes(run.status)) {
     return { status: run.status, skipped: true as const, ambiguous: false as const };
   }
+  hooks.notify = await createWebhookNotifier(runtime.webhooks ?? dispatchWebhook, run);
 
   // Tool-call re-entry, checked before the plain-message check below
   // because it's more specific and, for a tool backed by a real external
@@ -569,11 +704,18 @@ export async function executeAgentTurn(
   // completion (see API_CONTRACTS.md, checkpoint 2.4's "known, accepted
   // trade-off" — closed by this check, not assumed away). Backing off
   // writes nothing and lets whoever is actually alive finish.
+  // A retry attempt of the owning Trigger.dev run proves the previous
+  // attempt has ended (attempts never overlap), so its leftovers are
+  // abandoned and are recovered now, not deferred to the time-based gate —
+  // which, after a crash within the last 120 s, would otherwise skip,
+  // complete this attempt successfully, and strand the run (decisions/0016).
+  const previousAttemptEnded = isRetryOfOwningRun(run, execution);
+
   const staleToolInvocation = await prisma.toolInvocation.findFirst({
     where: { agentRunId: run.id, status: "RUNNING" },
   });
   if (staleToolInvocation) {
-    if (await isAgentRunRecentlyActive(run.id)) {
+    if (!previousAttemptEnded && (await isAgentRunRecentlyActive(run.id))) {
       return { status: await readAgentRunStatus(run.id), skipped: true as const, ambiguous: false as const };
     }
     const tool = registry.get(staleToolInvocation.toolName);
@@ -592,18 +734,12 @@ export async function executeAgentTurn(
       const reconciled = await tool
         .reconcile({ id: staleToolInvocation.id, providerRunId: staleToolInvocation.providerRunId })
         .catch(() => null);
-      if (reconciled?.status === "completed") {
-        await prisma.toolInvocation.updateMany({
-          where: { id: staleToolInvocation.id, status: "RUNNING" },
-          data: { status: "COMPLETED", output: reconciled.output as Prisma.InputJsonValue },
-        });
-      } else if (reconciled?.status === "failed") {
-        await prisma.toolInvocation.updateMany({
-          where: { id: staleToolInvocation.id, status: "RUNNING" },
-          data: { status: "FAILED", errorCode: reconciled.errorCode, errorMessage: reconciled.errorMessage },
-        });
-      }
+      if (reconciled) await persistReconciledOutcome(staleToolInvocation.id, reconciled);
     }
+    // Archive outputs of this run's COMPLETED invocations (including one
+    // just reconciled) from their stored output — never a new Magica run.
+    await archiveRunGeneratedAssets(run.id);
+    await settleRunCredits(run.id);
     return ambiguousOutcome(run.id, emit);
   }
 
@@ -623,9 +759,12 @@ export async function executeAgentTurn(
     where: { agentRunId: run.id, role: "ASSISTANT", status: "PENDING" },
   });
   if (stalePending) {
-    if (await isAgentRunRecentlyActive(run.id)) {
+    if (!previousAttemptEnded && (await isAgentRunRecentlyActive(run.id))) {
       return { status: await readAgentRunStatus(run.id), skipped: true as const, ambiguous: false as const };
     }
+    // A crash after a tool completed but before its outputs were archived/settled.
+    await archiveRunGeneratedAssets(run.id);
+    await settleRunCredits(run.id);
     return ambiguousOutcome(run.id, emit);
   }
 
@@ -642,6 +781,7 @@ export async function executeAgentTurn(
     return { status: toRunning.currentStatus, skipped: true as const, ambiguous: false as const };
   }
   await emit({ type: "run_status", status: "RUNNING" });
+  await hooks.notify?.("agent.started", { status: "RUNNING" });
 
   // The skill system prompt is synthesized fresh on every entry (never
   // persisted as a Message) from the injected skill registry's current
@@ -655,7 +795,7 @@ export async function executeAgentTurn(
     role: "system",
     content: buildSkillSystemPrompt(listSkillMetadata(skillRegistry)),
   };
-  const history = [skillSystemPrompt, ...(await buildConversationContext(run.chatId))];
+  const history = [skillSystemPrompt, ...(await buildConversationContext(run.chatId, run.userId))];
 
   // Committed before the provider call — this row is "persist the
   // request/attempt state before making the call." It accumulates every
@@ -691,89 +831,404 @@ export async function executeAgentTurn(
     throw error;
   }
 
+  const state: TurnState = {
+    runId: run.id,
+    chatId: run.chatId,
+    messageId: pendingMessage.id,
+    emit,
+    textStream: runtime.openTextStream(),
+    content: [],
+    thinkingMs: 0,
+  };
+  try {
+    if (payload.directTool) {
+      return await runDirectTool({ run, state, registry, call: payload.directTool, notify: hooks.notify });
+    }
+    return await runTurnLoop({ run, state, history, registry, runtime, notify: hooks.notify });
+  } finally {
+    await state.textStream.close();
+  }
+}
+
+type TurnResult = { status: AgentRunStatus; skipped: boolean; ambiguous: boolean };
+
+/** Everything one execution of a turn accumulates into its pending message. */
+type TurnState = {
+  runId: string;
+  chatId: string;
+  messageId: string;
+  emit: EmitRunEvent;
+  textStream: TextStreamSink;
+  /** Every block produced so far, in order (persisted into the pending message). */
+  content: ContentBlock[];
+  /** Total time-to-first-output across rounds (timing only, never reasoning). */
+  thinkingMs: number;
+};
+
+/** Thrown from the text callback when the pending message is no longer ours. */
+class RunNoLongerActive extends Error {}
+
+/** Streamed text reaches PostgreSQL at most this often while a round streams. */
+const PARTIAL_TEXT_FLUSH_MS = 1000;
+
+/** Content-only, guarded on the message still being PENDING: false means the
+ * run was cancelled/interrupted/finalized elsewhere. */
+async function persistPending(state: TurnState, content: ContentBlock[]): Promise<boolean> {
+  const updated = await prisma.message.updateMany({
+    where: { id: state.messageId, status: "PENDING" },
+    data: { content: content as Prisma.InputJsonValue, thinkingMs: state.thinkingMs },
+  });
+  return updated.count > 0;
+}
+
+/** Stop/interrupt keeps the message's content; text streamed since the last
+ * flush is added to the CANCELLED message (never to a FAILED/COMPLETE one). */
+async function preserveCancelledText(state: TurnState, text: string | null) {
+  if (!text?.trim()) return;
+  await prisma.message.updateMany({
+    where: { id: state.messageId, status: "CANCELLED" },
+    data: { content: [...state.content, { type: "text", text }] as Prisma.InputJsonValue, thinkingMs: state.thinkingMs },
+  });
+}
+
+async function skippedResult(runId: string): Promise<TurnResult> {
+  return { status: await readAgentRunStatus(runId), skipped: true, ambiguous: false };
+}
+
+/**
+ * One model call, streamed: visible text deltas go to the realtime text
+ * stream and (throttled) into the pending message; thinking time is the
+ * time to the first output. Failure outcomes keep any partial text.
+ */
+async function modelRound(
+  state: TurnState,
+  round: number,
+  messages: ProviderMessage[],
+  tools: OpenRouterToolSpec[],
+): Promise<{ ok: true; result: OpenRouterTurnResult } | { ok: false; done: TurnResult }> {
+  await state.emit({ type: "step", step: "thinking", round });
+  const startedAt = Date.now();
+  let thinkingRecorded = false;
+  const recordThinking = async () => {
+    if (thinkingRecorded) return;
+    thinkingRecorded = true;
+    const durationMs = Date.now() - startedAt;
+    state.thinkingMs += durationMs;
+    await state.emit({ type: "thinking_completed", round, durationMs });
+  };
+
+  let partial = "";
+  let lastFlush = Date.now();
+  let result: OpenRouterTurnResult;
+  try {
+    result = await callOpenRouter(messages, tools, {
+      onTextDelta: async (delta) => {
+        if (!thinkingRecorded) {
+          await recordThinking();
+          await state.emit({ type: "step", step: "responding", round });
+        }
+        partial += delta;
+        state.textStream.write({ messageId: state.messageId, round, delta });
+        if (Date.now() - lastFlush >= PARTIAL_TEXT_FLUSH_MS) {
+          lastFlush = Date.now();
+          if (!(await persistPending(state, [...state.content, { type: "text", text: partial }]))) {
+            throw new RunNoLongerActive();
+          }
+        }
+      },
+    });
+  } catch (error) {
+    if (error instanceof RunNoLongerActive) {
+      await preserveCancelledText(state, partial);
+      return { ok: false, done: await skippedResult(state.runId) };
+    }
+    if (error instanceof OpenRouterAmbiguousError) {
+      // Logged before any database write, so the outcome is diagnosable even
+      // if persisting it fails. Error class only: no provider text or prompt.
+      console.warn("Provider call outcome unknown", {
+        agentRunId: state.runId,
+        messageId: state.messageId,
+        round,
+        error: error.name,
+      });
+      return { ok: false, done: await ambiguousOutcome(state.runId, state.emit) };
+    }
+    if (error instanceof OpenRouterDefiniteError) {
+      await recordThinking();
+      const kept = error.partialText ?? (partial.trim() || null);
+      // Logged before persistence (see above). The code is our own enum;
+      // provider messages and partial text are never logged — only a length.
+      console.warn("Provider call failed", {
+        agentRunId: state.runId,
+        messageId: state.messageId,
+        round,
+        code: error.code,
+        partialTextChars: kept?.length ?? 0,
+      });
+      const content: ContentBlock[] = kept ? [...state.content, { type: "text", text: kept }] : state.content;
+      return {
+        ok: false,
+        done: await definiteFailureOutcome(
+          state.runId,
+          state.messageId,
+          error.code,
+          error.message,
+          content,
+          state.emit,
+          state.thinkingMs,
+        ),
+      };
+    }
+    // Genuinely unexpected (e.g. a DB write failure) — rethrow and let
+    // Trigger.dev's own retry policy handle it. The next attempt's
+    // re-entry check finds this same PENDING row and treats it as
+    // ambiguous rather than calling OpenRouter again.
+    throw error;
+  }
+  await recordThinking();
+
+  // Checked immediately after the provider call returns — the critical
+  // window: a cancel could have landed while this call was in flight.
+  const afterCall = await readAgentRunStatus(state.runId);
+  if (afterCall !== "RUNNING") {
+    await preserveCancelledText(state, result.text);
+    return { ok: false, done: { status: afterCall, skipped: true, ambiguous: false } };
+  }
+  return { ok: true, result };
+}
+
+const PLAN_MODE_INSTRUCTION =
+  "Plan mode is on. Do not call any tools and do not carry out the request yet. Reply only with a short, " +
+  "numbered plan of the steps you would take, naming any tools you would use. The user will approve or " +
+  "reject the plan before you act.";
+
+/**
+ * Plan mode: round 0 proposes a plan (no tools offered), then the run
+ * waits at a PLAN waitpoint. Approve → the plan and approval join the
+ * conversation and the normal loop continues; reject → the turn completes
+ * with the plan as its answer; expiry → the run stops (content kept).
+ */
+async function planPhase(params: {
+  run: { id: string; chatId: string };
+  state: TurnState;
+  history: ProviderMessage[];
+  runtime: TurnRuntime;
+}): Promise<{ done: TurnResult } | { approved: ProviderMessage[] }> {
+  const { run, state, history, runtime } = params;
+  await prisma.agentRun.update({ where: { id: run.id }, data: { turnCount: 1 } });
+  const [systemPrompt, ...conversation] = history;
+  const round = await modelRound(state, 0, [systemPrompt, { role: "system", content: PLAN_MODE_INSTRUCTION }, ...conversation], []);
+  if (!round.ok) return { done: round.done };
+
+  const plan = round.result.text;
+  if (!plan) {
+    return {
+      done: await definiteFailureOutcome(
+        run.id,
+        state.messageId,
+        "EMPTY_PLAN",
+        "The model didn't propose a plan. Send the message again, or turn plan mode off.",
+        state.content,
+        state.emit,
+        state.thinkingMs,
+      ),
+    };
+  }
+  state.content.push({ type: "text", text: plan });
+  if (!(await persistPending(state, state.content))) return { done: await skippedResult(run.id) };
+
+  const outcome = await awaitWaitpoint({
+    agentRunId: run.id,
+    type: "PLAN",
+    round: 0,
+    payload: { plan },
+    runtime: runtime.waitpoints,
+    emit: state.emit,
+  });
+  if (outcome.status === "inactive") return { done: await skippedResult(run.id) };
+  if (outcome.status === "expired") {
+    await state.emit({ type: "assistant_message", messageId: state.messageId, status: "CANCELLED" });
+    await state.emit({ type: "run_status", status: "CANCELLED", errorCode: WAITPOINT_EXPIRED_CODE });
+    return { done: { status: "CANCELLED", skipped: false, ambiguous: false } };
+  }
+  const { decision, note } = outcome.resolution as PlanResolution;
+  if (decision === "reject") {
+    return {
+      done: await successOutcome(run.id, state.messageId, run.chatId, state.content, round.result, state.emit, state.thinkingMs),
+    };
+  }
+  return {
+    approved: [
+      { role: "assistant", content: plan },
+      { role: "user", content: `The plan is approved. Carry it out now.${note ? ` Note from the user: ${note}` : ""}` },
+    ],
+  };
+}
+
+/**
+ * REST tool execution: the one requested call goes through exactly the same
+ * path as a model-requested call (registry, input schema, credit admission,
+ * persistence, settlement, archival, webhooks), and the turn ends with its
+ * outcome. No model is called.
+ */
+async function runDirectTool(params: {
+  run: { id: string; chatId: string; userId: string };
+  state: TurnState;
+  registry: ToolRegistry;
+  call: { name: string; input: Record<string, unknown> };
+  notify: WebhookNotifier | null;
+}): Promise<TurnResult> {
+  const { run, state, registry, call, notify } = params;
+  await prisma.agentRun.update({ where: { id: run.id }, data: { turnCount: 1 } });
+  await state.emit({ type: "step", step: "responding", round: 0 });
+  let outcome: ToolCallOutcome;
+  try {
+    outcome = await runOneToolCall({
+      toolCall: { id: `direct_${run.id}`, type: "function", function: { name: call.name, arguments: JSON.stringify(call.input) } },
+      registry,
+      agentRunId: run.id,
+      userId: run.userId,
+      messageId: state.messageId,
+      emit: state.emit,
+      onCompleted: notify
+        ? (invocationId, toolName) => notify("tool.completed", { status: "COMPLETED", toolInvocationId: invocationId, toolName })
+        : undefined,
+    });
+  } catch (error) {
+    // Still polling past its budget: left RUNNING for reconciliation, as in the loop.
+    if (error instanceof MagicaPollInconclusiveError) return skippedResult(run.id);
+    throw error;
+  }
+  state.content.push(...outcome.blocks);
+  const result = outcome.blocks.find((b) => b.type === "tool_result");
+  const error = result?.type === "tool_result" ? result.error : null;
+  if (error) {
+    return definiteFailureOutcome(run.id, state.messageId, error.code, error.message, state.content, state.emit, 0);
+  }
+  return successOutcome(run.id, state.messageId, run.chatId, state.content, NO_MODEL_USAGE, state.emit, 0);
+}
+
+/** Non-billable tool calls that run concurrently within one group. */
+const PARALLEL_TOOL_LIMIT = 3;
+
+/**
+ * Parallel-eligible: not billable, and not backed by an external provider
+ * run (a tool with `reconcile`, i.e. every Magica tool). Billable calls
+ * stay sequential because credit admission is a balance check, not a
+ * reservation: two concurrent billable calls could each pass it against
+ * the same balance and together overspend it.
+ */
+function isParallelEligible(toolName: string, registry: ToolRegistry): boolean {
+  return !isBillableTool(toolName) && !registry.get(toolName)?.reconcile;
+}
+
+/** Consecutive parallel-eligible calls form one group; every other call is
+ * its own group. Group order, and order within a group, is the model's. */
+function groupToolCalls(calls: ProviderToolCall[], registry: ToolRegistry): ProviderToolCall[][] {
+  const groups: ProviderToolCall[][] = [];
+  for (const call of calls) {
+    const last = groups.at(-1);
+    const eligible = isParallelEligible(call.function.name, registry);
+    if (eligible && last && isParallelEligible(last[0].function.name, registry)) last.push(call);
+    else groups.push([call]);
+  }
+  return groups;
+}
+
+/** Runs `fn` over `items` with at most `limit` in flight; results in input order. */
+async function settleWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++;
+      try {
+        results[index] = { status: "fulfilled", value: await fn(items[index]) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+async function runTurnLoop(params: {
+  run: { id: string; chatId: string; userId: string; planMode: boolean };
+  state: TurnState;
+  history: ProviderMessage[];
+  registry: ToolRegistry;
+  runtime: TurnRuntime;
+  notify: WebhookNotifier | null;
+}): Promise<TurnResult> {
+  const { run, state, history, registry, runtime, notify } = params;
+  const { content, emit } = state;
   const providerTools = toOpenRouterTools(registry);
-  const content: ContentBlock[] = [];
   // The in-progress turn's own assistant-tool_calls/tool-result messages,
-  // appended to `history` on each call — never derived from the
-  // database, since tools aren't exposed to real conversations yet and
-  // reconstructing this sequence across turns isn't needed in Phase 2.
+  // appended to `history` on each call — never derived from the database.
   const turnMessages: ProviderMessage[] = [];
 
-  for (let turn = 0; turn < MAX_TURNS; turn++) {
+  let firstRound = 0;
+  if (run.planMode) {
+    const planned = await planPhase({ run, state, history, runtime });
+    if ("done" in planned) return planned.done;
+    turnMessages.push(...planned.approved);
+    firstRound = 1;
+  }
+
+  for (let turn = firstRound; turn < MAX_TURNS; turn++) {
     // Checked between loop iterations: a cancel arriving while idle
     // between rounds is caught here, before wasting another provider
     // call that would just be discarded anyway.
     const beforeRound = await readAgentRunStatus(run.id);
     if (beforeRound !== "RUNNING") {
-      return { status: beforeRound, skipped: true as const, ambiguous: false as const };
+      return { status: beforeRound, skipped: true, ambiguous: false };
     }
 
     await prisma.agentRun.update({ where: { id: run.id }, data: { turnCount: turn + 1 } });
 
-    let result;
-    try {
-      result = await callOpenRouter([...history, ...turnMessages], providerTools);
-    } catch (error) {
-      if (error instanceof OpenRouterAmbiguousError) {
-        return ambiguousOutcome(run.id, emit);
-      }
-      if (error instanceof OpenRouterDefiniteError) {
-        return definiteFailureOutcome(run.id, pendingMessage.id, error.code, error.message, content, emit);
-      }
-      // Genuinely unexpected (e.g. a DB write failure) — rethrow and let
-      // Trigger.dev's own retry policy handle it. The next attempt's
-      // re-entry check above will find this same PENDING row and treat
-      // it as ambiguous rather than calling OpenRouter again.
-      throw error;
-    }
-
-    // Checked immediately after the provider call returns — the
-    // critical window: a cancel could have landed in the database while
-    // this call was in flight. Caught here, before any write assumes
-    // the run is still ours to finalize.
-    const afterCall = await readAgentRunStatus(run.id);
-    if (afterCall !== "RUNNING") {
-      return { status: afterCall, skipped: true as const, ambiguous: false as const };
-    }
+    const round = await modelRound(state, turn, [...history, ...turnMessages], providerTools);
+    if (!round.ok) return round.done;
+    const result = round.result;
 
     // Pushed before branching on tool_calls so user-visible `content`
     // sent alongside a tool request is kept, not just the final answer.
     if (result.text) content.push({ type: "text", text: result.text });
 
     if (!result.toolCalls) {
-      return successOutcome(run.id, pendingMessage.id, run.chatId, content, result, emit);
+      return successOutcome(run.id, state.messageId, run.chatId, content, result, emit, state.thinkingMs);
     }
 
     // The *last* permitted round: a tool_calls response here can never
     // be returned to the model (there is no round `turn + 1` to feed
     // the result back into) — executing it would spend real work (real
-    // external-provider credits, once Phase 3 registers Magica tools)
-    // for an outcome nothing can ever use. Each requested call is
-    // recorded CANCELLED instead of executed — a real, auditable
-    // ToolInvocation + content-block pair, never silently discarded —
-    // and the run ends via the same TURN_LIMIT_EXCEEDED path used when
-    // the model never stops requesting tools at all.
+    // external-provider credits) for an outcome nothing can ever use.
+    // Each requested call is recorded CANCELLED instead of executed — a
+    // real, auditable ToolInvocation + content-block pair, never silently
+    // discarded — and the run ends via TURN_LIMIT_EXCEEDED.
     if (turn === MAX_TURNS - 1) {
       for (const toolCall of result.toolCalls) {
         const outcome = await recordTurnLimitCancellation({
           toolCall,
           agentRunId: run.id,
-          messageId: pendingMessage.id,
+          messageId: state.messageId,
           emit,
         });
         content.push(...outcome.blocks);
       }
-      await prisma.message.update({
-        where: { id: pendingMessage.id },
-        data: { content: content as Prisma.InputJsonValue },
-      });
+      await persistPending(state, content);
       return definiteFailureOutcome(
         run.id,
-        pendingMessage.id,
+        state.messageId,
         "TURN_LIMIT_EXCEEDED",
         "The agent requested additional tool calls on the final permitted turn; they could not be executed because their results could never have been returned to the model. See the accompanying tool_use/tool_result blocks.",
         content,
         emit,
+        state.thinkingMs,
       );
     }
 
@@ -783,54 +1238,62 @@ export async function executeAgentTurn(
     // immediately followed by one tool-role message per call.
     turnMessages.push({ role: "assistant", content: result.text, tool_calls: result.toolCalls });
 
-    // Sequential, not parallel — the simplest design that still keeps
-    // result/charge/message ordering deterministic (true parallel
-    // execution would need its own serialization for the ToolInvocation
-    // inserts and the shared `content` array; not worth it before a real
-    // tool has latency that makes it matter).
-    for (const toolCall of result.toolCalls) {
-      // Checked immediately before each tool execution.
+    // Independent non-billable calls run in parallel (bounded); billable
+    // calls run one at a time. Results, tool messages and content blocks
+    // are always appended in the model's call order, never completion
+    // order, so ordering is deterministic. Each invocation keeps its own
+    // row, idempotency key and exactly-once settlement.
+    for (const group of groupToolCalls(result.toolCalls, registry)) {
+      // Checked immediately before each group of tool executions.
       const beforeTool = await readAgentRunStatus(run.id);
       if (beforeTool !== "RUNNING") {
-        return { status: beforeTool, skipped: true as const, ambiguous: false as const };
+        return { status: beforeTool, skipped: true, ambiguous: false };
       }
 
-      let outcome: ToolCallOutcome;
-      try {
-        outcome = await runOneToolCall({
+      const settled = await settleWithConcurrency(group, PARALLEL_TOOL_LIMIT, (toolCall) =>
+        runOneToolCall({
           toolCall,
           registry,
           agentRunId: run.id,
           userId: run.userId,
-          messageId: pendingMessage.id,
+          messageId: state.messageId,
           emit,
+          onCompleted: notify
+            ? (invocationId, toolName) =>
+                notify("tool.completed", { status: "COMPLETED", toolInvocationId: invocationId, toolName })
+            : undefined,
+        }),
+      );
+      let failure: { reason: unknown } | null = null;
+      let appended = false;
+      for (const outcome of settled) {
+        if (outcome.status === "fulfilled") {
+          content.push(...outcome.value.blocks);
+          turnMessages.push(outcome.value.providerMessage);
+          appended = true;
+        } else failure ??= { reason: outcome.reason };
+      }
+
+      // Persisted after each group, so a cancellation detected partway
+      // through a round never loses an already-finished result.
+      // Content-only; never touches status (disjoint columns, no guard).
+      if (appended) {
+        await prisma.message.update({
+          where: { id: state.messageId },
+          data: { content: content as Prisma.InputJsonValue, thinkingMs: state.thinkingMs },
         });
-      } catch (error) {
+      }
+
+      if (failure) {
         // A Magica-backed tool's execute() exhausted its own polling
         // budget (or the run was cancelled mid-poll) — genuinely still
         // can't tell the outcome. The ToolInvocation is left exactly
         // as runOneToolCall left it (RUNNING, providerRunId intact if
-        // persisted) — back off the same way every other mid-round
-        // guard loss does: write nothing further, let a later
-        // re-entry's reconcile() pick this up. Not a loop resumption —
-        // this execution attempt simply ends here.
-        if (error instanceof MagicaPollInconclusiveError) {
-          return { status: await readAgentRunStatus(run.id), skipped: true as const, ambiguous: false as const };
-        }
-        throw error;
+        // persisted) — back off without writing anything further; a
+        // later re-entry's reconcile() picks it up.
+        if (failure.reason instanceof MagicaPollInconclusiveError) return skippedResult(run.id);
+        throw failure.reason;
       }
-      content.push(...outcome.blocks);
-      turnMessages.push(outcome.providerMessage);
-
-      // Persisted after *each* tool call, not batched once per round —
-      // so a cancellation detected partway through a multi-tool-call
-      // round never loses an earlier call's already-finished result.
-      // Content-only; never touches status, so it's safe even if a
-      // cancel is racing it (disjoint columns, no guard needed here).
-      await prisma.message.update({
-        where: { id: pendingMessage.id },
-        data: { content: content as Prisma.InputJsonValue },
-      });
     }
   }
 
@@ -838,11 +1301,12 @@ export async function executeAgentTurn(
   // outcome (we chose to stop) — not ambiguous.
   return definiteFailureOutcome(
     run.id,
-    pendingMessage.id,
+    state.messageId,
     "TURN_LIMIT_EXCEEDED",
     "The agent did not produce a final answer within the maximum number of turns.",
     content,
     emit,
+    state.thinkingMs,
   );
 }
 
@@ -851,8 +1315,13 @@ export const runAgentTurn = task({
   // Wrapped, not passed directly: Trigger.dev calls `run(payload, ctx)`
   // with its own second argument, which would otherwise land in
   // executeAgentTurn's `registry` parameter and silently break the
-  // default. Production always gets the one-argument call, so all three
-  // defaults (PRODUCTION_TOOL_REGISTRY, the real publisher,
-  // PRODUCTION_SKILL_REGISTRY) apply.
-  run: (payload: RunAgentTurnPayload) => executeAgentTurn(payload),
+  // default. Production passes only the payload and the execution, so the
+  // production registry, publisher, skill registry and runtime apply.
+  // `ctx` identifies this attempt, which lets re-entry tell a retry of this
+  // run (previous attempt certainly ended) from a concurrent execution.
+  run: (payload: RunAgentTurnPayload, { ctx }) =>
+    executeAgentTurn(payload, undefined, undefined, undefined, undefined, {
+      triggerRunId: ctx.run.id,
+      attempt: ctx.attempt.number,
+    }),
 });

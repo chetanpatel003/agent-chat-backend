@@ -4,12 +4,14 @@ import {
   AgentRunStatus,
   ToolInvocationStatus,
   WaitpointStatus,
+  WaitpointType,
   WaitingReason,
 } from "@/generated/prisma/enums";
 
 export const AgentRunStatusSchema = enumSchema(AgentRunStatus);
 export const ToolInvocationStatusSchema = enumSchema(ToolInvocationStatus);
 export const WaitpointStatusSchema = enumSchema(WaitpointStatus);
+export const WaitpointTypeSchema = enumSchema(WaitpointType);
 export const WaitingReasonSchema = enumSchema(WaitingReason);
 
 export const AgentRunResponseSchema = z.object({
@@ -21,6 +23,7 @@ export const AgentRunResponseSchema = z.object({
   promptTokens: z.number().int().nonnegative().nullable(),
   completionTokens: z.number().int().nonnegative().nullable(),
   turnCount: z.number().int().nonnegative(),
+  planMode: z.boolean(),
   errorCode: z.string().nullable(),
   errorMessage: z.string().nullable(),
   startedAt: z.iso.datetime().nullable(),

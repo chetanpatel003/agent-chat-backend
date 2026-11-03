@@ -1,0 +1,20 @@
+---
+title: Introduction
+description: A durable agent chat backend with real media tools.
+---
+
+Agent Chat is a chat application whose assistant runs as a **durable background agent**. A REST
+request admits a message and returns immediately; the agent turn runs on Trigger.dev, streams
+text and progress over realtime, can pause for your approval, calls media tools (Magica: generate,
+edit and crop images, merge videos), and persists everything in PostgreSQL.
+
+- **Versioned REST API** under `/api/v1` — conversations, runs, approvals, media, credits, webhooks.
+- **Signed webhooks** for `agent.started`, `agent.completed`, `agent.failed`, `tool.completed`.
+- **Model**: OpenRouter's free route only (`openrouter/free`); paid routes are refused.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" href="/quickstart">Run it locally and send your first message.</Card>
+  <Card title="Agent runs" href="/concepts/agent-runs">Lifecycle, streaming, stop and interrupt.</Card>
+  <Card title="Webhooks" href="/webhooks">Verify signatures and handle retries.</Card>
+  <Card title="Authentication" href="/authentication">Clerk tokens, ownership and idempotency.</Card>
+</CardGroup>

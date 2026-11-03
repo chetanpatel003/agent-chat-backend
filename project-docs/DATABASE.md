@@ -146,3 +146,25 @@ before `AgentRun`.
 
 ## Config note
 `prisma.config.ts`'s `datasource.url` is CLI-only and points at `DIRECT_DATABASE_URL`. The app's runtime `PrismaClient` (not yet written) will use `@prisma/adapter-pg` with the pooled `DATABASE_URL` instead — Prisma 7 has no `directUrl` field in `prisma.config.ts`, unlike older `schema.prisma`-embedded config.
+
+## Credit accounting (checkpoint 5.1) — no schema change
+- `CreditAccount.balance`, `CreditLedger.amount/balanceAfter`, `ToolInvocation.creditsCharged`: BigInt, Magica's raw integer unit, never scaled.
+- `ToolInvocation.creditsCharged IS NULL` = not yet settled; set once inside the settlement transaction (guarded update). `0` = settled with zero usage.
+- `CreditLedger.idempotencyKey` (unique) = `tool-charge:{toolInvocationId}` for settlements — the database-level duplicate guard.
+- Settlement locks the user's `CreditAccount` row (`SELECT … FOR UPDATE`); concurrent settlements for one user serialize. A zero-balance account row may be created to hold the lock (not a grant).
+- Ledger sign: positive adds credits (GRANT/REFUND), negative removes (TOOL_CHARGE).
+- Migration `20261102200000_credit_usage_and_balance_check`: adds `ToolInvocation.creditsUsed` (actual provider usage; `creditsCharged` = amount collected; shortfall = the difference) and two hand-written CHECK constraints — `CreditAccount_balance_nonnegative` (`balance >= 0`) and `ToolInvocation_credits_collected_within_used` (`creditsCharged IS NULL OR (creditsUsed IS NOT NULL AND 0 <= creditsCharged <= creditsUsed)`). Prisma does not model CHECKs (same convention as `AgentRun_one_active_per_chat`); `migrate diff` stays empty. Rollback SQL is in the migration file.
+
+## Interaction experience — migration `20261103100000_interaction_experience`
+Additive only (safe with a running older worker):
+- `AgentRun.planMode BOOLEAN NOT NULL DEFAULT false`
+- `Message.thinkingMs INTEGER NULL` (timing only)
+- index `Waitpoint_status_expiresAt_idx` on `Waitpoint(status, expiresAt)` for the expiry sweep.
+The existing `Waitpoint` model/enums are used unchanged. Rollback statements are in the
+migration file. Drift check after apply: empty.
+
+## Media picker — migration `20261103200000_message_attachment`
+New table `MessageAttachment(messageId, attachmentId, order, createdAt)`: PK (messageId,
+attachmentId), unique (messageId, order), index (attachmentId), FKs cascade on delete. Backfill
+inserts one row per upload already sent with a user message (no existing row is changed).
+Rollback: `DROP TABLE "MessageAttachment";`. See decisions/0017.

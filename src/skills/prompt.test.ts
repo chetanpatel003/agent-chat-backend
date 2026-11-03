@@ -22,6 +22,15 @@ describe("buildSkillSystemPrompt", () => {
     expect(prompt).not.toContain("Preserve the subject");
   });
 
+  it("tells the model never to paste media URLs or file lists, nor to claim media it did not generate", () => {
+    for (const prompt of [buildSkillSystemPrompt([]), buildSkillSystemPrompt([{ name: "a", description: "b" }])]) {
+      expect(prompt).toContain("Never write file or media URLs in your reply");
+      expect(prompt).toContain('"Generated files" lists');
+      expect(prompt).toContain("when you called the tool in\nthis turn and it succeeded");
+      expect(prompt).toContain("Never state how many credits a tool used");
+    }
+  });
+
   it("handles an empty skill list without crashing", () => {
     expect(() => buildSkillSystemPrompt([])).not.toThrow();
     expect(buildSkillSystemPrompt([])).toMatch(/no optional skills/i);

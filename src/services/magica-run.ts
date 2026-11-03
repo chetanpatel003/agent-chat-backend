@@ -99,15 +99,27 @@ export async function pollMagicaRunToCompletion(params: {
   agentRunId: string;
   providerRunId: string;
   waitFn?: DurableWait;
+  /** Defaults to the in-turn budget. The recovery sweep uses 1 (a single read, no wait). */
+  maxAttempts?: number;
+  /** Defaults to true: stop once the owning AgentRun is no longer RUNNING. The recovery
+   * sweep sets false — it exists precisely for invocations whose run already ended. */
+  requireActiveRun?: boolean;
 }): Promise<PollOutcome> {
-  const { agentRunId, providerRunId, waitFn = durableWait } = params;
+  const {
+    agentRunId,
+    providerRunId,
+    waitFn = durableWait,
+    maxAttempts = MAGICA_POLL_MAX_ATTEMPTS,
+    requireActiveRun = true,
+  } = params;
   const startedAt = Date.now();
 
-  for (let attempt = 0; attempt < MAGICA_POLL_MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const lastAttempt = attempt + 1 >= maxAttempts;
     if (Date.now() - startedAt > MAGICA_POLL_MAX_ELAPSED_MS) {
       throw new MagicaPollInconclusiveError("Polling budget (elapsed time) exhausted without a definitive outcome");
     }
-    if ((await readAgentRunStatus(agentRunId)) !== "RUNNING") {
+    if (requireActiveRun && (await readAgentRunStatus(agentRunId)) !== "RUNNING") {
       // The run was cancelled (or otherwise left RUNNING) by something
       // else entirely — stop polling promptly. This says nothing about
       // whether Magica's own run stopped; only that it's no longer
@@ -121,7 +133,7 @@ export async function pollMagicaRunToCompletion(params: {
     } catch {
       // Every getMagicaRun() failure is transient by construction
       // (see its own doc comment) — retry the poll, not the run.
-      await waitFn(MAGICA_POLL_INTERVAL_SECONDS);
+      if (!lastAttempt) await waitFn(MAGICA_POLL_INTERVAL_SECONDS);
       continue;
     }
 
@@ -139,7 +151,7 @@ export async function pollMagicaRunToCompletion(params: {
     // QUEUED/RUNNING, or any other, unrecognized status — explicitly
     // not mapped to FAILED/COMPLETED; keep polling within budget
     // regardless of which pending or unrecognized value it is.
-    await waitFn(MAGICA_POLL_INTERVAL_SECONDS);
+    if (!lastAttempt) await waitFn(MAGICA_POLL_INTERVAL_SECONDS);
   }
 
   throw new MagicaPollInconclusiveError("Polling budget (attempt count) exhausted without a definitive outcome");
@@ -155,9 +167,13 @@ export async function pollMagicaRunToCompletion(params: {
  * `MagicaPollInconclusiveError` immediately, the same signal as an
  * exhausted polling budget.
  */
+/** Options for an out-of-turn reconciliation (the recovery sweep). */
+export type ReconcileOptions = { singlePoll?: boolean };
+
 export async function reconcileMagicaRun(
   invocation: { id: string; providerRunId: string | null },
   waitFn: DurableWait = durableWait,
+  options: ReconcileOptions = {},
 ): Promise<PollOutcome> {
   if (!invocation.providerRunId) {
     throw new MagicaPollInconclusiveError(
@@ -172,6 +188,8 @@ export async function reconcileMagicaRun(
     agentRunId: run.agentRunId,
     providerRunId: invocation.providerRunId,
     waitFn,
+    // Sweep: one status read, regardless of the (already ended) AgentRun.
+    ...(options.singlePoll ? { maxAttempts: 1, requireActiveRun: false } : {}),
   });
   return outcome;
 }

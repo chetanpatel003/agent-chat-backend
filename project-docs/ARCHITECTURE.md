@@ -53,5 +53,23 @@ trusting the frontend). That condition is implemented: see
 - Full detail, including the security model and durable-resume
   behavior: API_CONTRACTS.md.
 
+## Implemented — core interaction experience
+- **Streaming**: `providers/openrouter.ts` streams (SSE) when given `onTextDelta`; the loop
+  forwards deltas to the `assistant-text` Trigger.dev stream (`realtime/text-stream.ts`) and
+  flushes partial text to the pending message (≤ 1/s). Metadata events stay content-free.
+- **Steps / thinking**: `step` and `thinking_completed` events; `Message.thinkingMs` (timing only).
+- **Waitpoints**: `services/waitpoint.ts` — `Waitpoint` row (authoritative) + Trigger.dev
+  waitpoint token (suspension). Type registry in `contracts/waitpoint.ts` (PLAN today).
+  Plan mode = first round without tools, then a PLAN waitpoint.
+- **Stop / Interrupt**: one in-transaction cancel helper (`cancelActiveRunInTx`) used by the
+  cancel route and by send-turn's interrupt admission; also cancels open waitpoints.
+- **Parallel tools**: grouped execution in `run-agent-turn.ts`; billable/provider-backed calls
+  stay sequential (see API_CONTRACTS.md).
+- **Recovery**: `recover-waitpoints` scheduled sweep; `recover-stale-runs` sweep and
+  execution-aware re-entry for runs left active with no execution (decision 0016).
+
 ## Data model
 See DATABASE.md.
+
+## Credits (checkpoint 5.1)
+Billable work is Magica tool usage only (OpenRouter costs 0). Admission runs inside each Magica tool before the provider call (`services/credit-admission.ts`); settlement runs in the orchestrator after the invocation's terminal state is persisted and on run recovery (`services/credit-settlement.ts`), never inside the provider adapter. Units and policies: `project-docs/magica/CREDIT_ACCOUNTING.md`.

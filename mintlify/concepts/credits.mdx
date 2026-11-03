@@ -1,0 +1,16 @@
+---
+title: Credits
+description: Exactly-once settlement of media tool usage.
+---
+
+Model usage (OpenRouter free route) costs **zero** credits. Each Magica tool invocation is charged
+the provider's own reported usage, in raw units (displayed ÷ 1,000,000 as "M").
+
+- **Admission** before a billable call: fixed cost (crop) or a provider estimate (image
+  generation, explicit size). Insufficient balance fails the tool call cleanly.
+- **Settlement** as soon as the tool's outcome is recorded: one transaction locks the account row, claims the invocation
+  once, debits and writes a ledger entry with a unique key — duplicates change nothing. The
+  balance never goes negative; any shortfall is recorded.
+- **Recovery**: a durable settlement task plus a 10-minute sweep settle anything missed.
+
+`GET /api/v1/credits/balance` and `GET /api/v1/credits/ledger`.

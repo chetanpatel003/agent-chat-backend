@@ -254,3 +254,44 @@ function classifyHttpStatus(status: number, phase: "start"): MagicaDefiniteError
   }
   return new MagicaDefiniteError(`Magica ${phase} request was rejected (HTTP ${status})`, "MAGICA_START_REJECTED");
 }
+
+// ---------- Credit estimate (no run, no charge) ----------
+// `POST /v1/nodes/estimate-credits`: "Pricing uses the same rules as
+// run-time billing, without starting a run or charging credits." Returns
+// raw integer `microcredits` — the same unit as a run's `creditUsed` and
+// the account balance (see project-docs/magica/CREDIT_ACCOUNTING.md).
+
+export type EstimateNode = { type: string; subModelId?: string; data?: Record<string, unknown> };
+
+const EstimateResponseSchema = z.object({
+  estimates: z.array(z.object({ microcredits: z.number().int().nonnegative() })).min(1),
+});
+
+/** Estimates one node's raw credit cost. Any network/HTTP/shape problem is a
+ * MagicaDefiniteError("MAGICA_ESTIMATE_UNAVAILABLE"): callers fail closed. */
+export async function estimateNodeCredits(node: EstimateNode): Promise<bigint> {
+  const key = apiKey();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl()}/v1/nodes/estimate-credits`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ nodes: [node] }),
+      signal: controller.signal,
+    });
+  } catch {
+    throw new MagicaDefiniteError("Magica credit estimate could not be reached", "MAGICA_ESTIMATE_UNAVAILABLE");
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!response.ok) {
+    throw new MagicaDefiniteError(`Magica credit estimate failed (HTTP ${response.status})`, "MAGICA_ESTIMATE_UNAVAILABLE");
+  }
+  const parsed = EstimateResponseSchema.safeParse(await response.json().catch(() => null));
+  if (!parsed.success) {
+    throw new MagicaDefiniteError("Magica credit estimate had an unexpected shape", "MAGICA_ESTIMATE_UNAVAILABLE");
+  }
+  return BigInt(parsed.data.estimates[0].microcredits);
+}

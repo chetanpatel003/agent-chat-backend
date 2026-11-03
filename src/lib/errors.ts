@@ -1,5 +1,15 @@
 import { ZodError } from "zod";
 import type { ErrorResponse } from "@/contracts/common";
+import { Prisma } from "@/generated/prisma/client";
+
+/** Prisma P2028 "Unable to start a transaction in the given time" (pool saturated). */
+function isPoolSaturated(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2028" &&
+    error.message.includes("Unable to start a transaction")
+  );
+}
 
 /** Missing or invalid bearer token. Always maps to 401. */
 export class UnauthorizedError extends Error {
@@ -40,11 +50,36 @@ export class ConflictError extends Error {
   }
 }
 
+/** The run's execution has ended for good, so a pending decision can't be
+ * applied; the run was stopped (RUN_INTERRUPTED). Not retryable. */
+export class RunInterruptedError extends Error {
+  constructor(message = "This run stopped unexpectedly, so the decision can't be applied. Send a new message to continue.") {
+    super(message);
+    this.name = "RunInterruptedError";
+  }
+}
+
+/** The execution's state couldn't be confirmed; nothing was changed. Retryable. */
+export class ExecutionStatusUnavailableError extends Error {
+  constructor(message = "We couldn't confirm the run is still waiting for you. Nothing was changed — try again in a moment.") {
+    super(message);
+    this.name = "ExecutionStatusUnavailableError";
+  }
+}
+
 const STATUS_BY_ERROR_NAME: Record<string, number> = {
   UnauthorizedError: 401,
   NotFoundError: 404,
   ValidationError: 400,
   ConflictError: 409,
+  TransloaditConfigError: 503,
+  TransloaditUnavailableError: 502,
+  UploadArchiveError: 502,
+  UploadStorageUnavailableError: 503,
+  AttachmentUrlUnavailableError: 500,
+  WaitpointResumeError: 503,
+  RunInterruptedError: 409,
+  ExecutionStatusUnavailableError: 503,
 };
 
 /** Maps a thrown error to a safe, non-leaking HTTP response. Anything not
@@ -69,6 +104,16 @@ export function toErrorResponse(error: unknown): {
         ok: false,
         error: { code: "ValidationError", message: issues || "Invalid request" },
       },
+    };
+  }
+
+  // Overload, not a fault: every pooled connection was busy for the whole
+  // transaction wait. Nothing was written (the transaction never started),
+  // so the request is safe to retry.
+  if (isPoolSaturated(error)) {
+    return {
+      status: 503,
+      body: { ok: false, error: { code: "ServiceBusy", message: "The service is busy. Try again in a moment." } },
     };
   }
 

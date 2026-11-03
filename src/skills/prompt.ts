@@ -6,9 +6,19 @@ import type { SkillMetadata } from "./types";
  * point of loading it on demand). Pure and deterministic so it's
  * testable without a real OpenRouter call.
  */
+/** Media replies: the app renders generated files itself (see contracts/assistant-text.ts). */
+export const MEDIA_REPLY_RULES = [
+  "Images and videos produced by your tools are shown to the user automatically.",
+  "Never write file or media URLs in your reply, and never repeat the",
+  '"Attached files" or "Generated files" lists — those URLs are only for tool inputs.',
+  "Only say you created or edited an image or video when you called the tool in",
+  "this turn and it succeeded.",
+  "Never state how many credits a tool used — the app shows each result's usage itself.",
+].join("\n");
+
 export function buildSkillSystemPrompt(skills: SkillMetadata[]): string {
   if (skills.length === 0) {
-    return "You have no optional skills available right now.";
+    return `You have no optional skills available right now.\n\n${MEDIA_REPLY_RULES}`;
   }
 
   const list = skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");
@@ -30,5 +40,7 @@ export function buildSkillSystemPrompt(skills: SkillMetadata[]): string {
     "skill's name and the relative path to read it. A skill's supporting",
     "assets can only be read after that skill has been loaded with",
     "`load_skill`.",
+    "",
+    MEDIA_REPLY_RULES,
   ].join("\n");
 }

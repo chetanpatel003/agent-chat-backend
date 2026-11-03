@@ -1,0 +1,16 @@
+---
+title: Authentication
+description: Clerk session tokens on every request.
+---
+
+Every `/api/v1` route requires `Authorization: Bearer <Clerk session JWT>`. The backend verifies
+the token with Clerk (`authorizedParties` = the configured `FRONTEND_ORIGIN`), maps the Clerk
+user to a local user on first sight, and enforces **ownership on every read and write**: another
+user's chat, run, attachment, waitpoint or webhook is indistinguishable from a missing one (`404`).
+
+Browser clients get tokens from Clerk's SDK (`getToken()`). CORS allows exactly the configured
+frontend origin.
+
+Mutating requests that start work (`POST /messages`, `POST /completions`) require an
+`Idempotency-Key` header. Reusing a key returns the original result; reusing someone else's key,
+or the same key for a different chat, is `409`.

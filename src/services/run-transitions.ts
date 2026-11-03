@@ -13,6 +13,35 @@ import type { AgentRunStatus } from "@/generated/prisma/enums";
  */
 export const ACTIVE_RUN_STATUSES: AgentRunStatus[] = ["QUEUED", "RUNNING", "WAITING"];
 
+/**
+ * For every interactive transaction that moves an AgentRun to a terminal
+ * (or WAITING) state. Prisma's defaults (2 s to obtain a connection, 5 s
+ * total) are too tight against Neon: opening a new pooled connection was
+ * measured at ~3.4 s from the dev environment, and a run-finishing
+ * transaction is 3–4 round trips of ~300 ms. A timeout here used to escape
+ * the worker and strand the run (see decisions/0016). Same values as
+ * credit settlement's transaction options.
+ */
+export const RUN_TRANSITION_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 } as const;
+
+/** The Trigger.dev execution running this turn (from the task context). */
+export type TurnExecution = { triggerRunId: string; attempt: number };
+
+/**
+ * True when this execution is a retry attempt of the very Trigger.dev run
+ * that owns the AgentRun. Trigger.dev starts a retry attempt only after the
+ * previous attempt has ended, so whatever state the previous attempt left
+ * is abandoned — no liveness guess is needed. Anything else (first attempt,
+ * an unknown/other run, no execution info) is not proof and falls back to
+ * the time-based liveness check.
+ */
+export function isRetryOfOwningRun(
+  run: { triggerRunId: string | null },
+  execution: TurnExecution | undefined,
+): boolean {
+  return !!execution && execution.attempt > 1 && !!run.triggerRunId && run.triggerRunId === execution.triggerRunId;
+}
+
 export type GuardedTransitionResult =
   | { applied: true }
   | { applied: false; currentStatus: AgentRunStatus };

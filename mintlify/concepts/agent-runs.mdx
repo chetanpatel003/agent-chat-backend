@@ -1,0 +1,31 @@
+---
+title: Agent runs
+description: Lifecycle, streaming, stop, interrupt and recovery.
+---
+
+**Statuses**: `QUEUED → RUNNING → (WAITING) → COMPLETED | FAILED | CANCELLED`.
+
+A turn is a bounded loop (8 model rounds) over OpenRouter's free route. Each round streams text
+(SSE); the routed model is checked to be `:free` before any text is shown. When the model calls
+tools, independent non-billable calls run in parallel (up to 3); billable media tools run one at a
+time so credit checks can't race. Results are always appended in the model's call order.
+
+## Realtime
+- **Events** (run metadata): `run_status`, `step` (`thinking`/`responding`/`waiting`),
+  `thinking_completed` (duration), `tool_started`/`tool_completed`/`tool_failed`,
+  `assistant_message`, `waitpoint`. No content.
+- **Text** (stream `assistant-text`): `{ messageId, round, delta }`.
+
+Get a read-only token for one run from `GET /runs/{runId}/realtime-token`.
+
+## Stop and interrupt
+- **Stop**: `POST /runs/{runId}/cancel` — idempotent; partial text and tool results are kept.
+- **Interrupt**: send a new message with `interruptRunId`; the active run is cancelled in the same
+  transaction that admits the new message.
+
+## Failure and recovery
+- A mid-stream provider failure keeps the partial text (`STREAM_INTERRUPTED`, `PROVIDER_ERROR`…).
+- An outcome that can't be known (network loss mid-request) is `AMBIGUOUS_PROVIDER_OUTCOME`; the
+  provider is **never** called a second time for it.
+- A crashed attempt is recovered by its own retry immediately; a run left with no execution is
+  ended by a 5-minute sweep (`RUN_INTERRUPTED`), only once Trigger.dev confirms nothing is running.

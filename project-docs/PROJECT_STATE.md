@@ -39,3 +39,123 @@ Neon Postgres (pooled+direct), Clerk, Trigger.dev (CLI logged in, project initia
 2. Confirmed: no message editing, retry only (creates new AgentRun via `retryOfRunId`).
 3. Attachment retention after Transloadit temp-URL expiry: re-host to S3-compatible storage, or document as known limitation?
 4. Confirmed: soft delete only, no hard purge.
+
+## Sprint log — 2026-11-03 (autonomous sprint)
+Later checkpoints (3.4–5.x, interaction experience, recovery, media picker) are recorded in
+`decisions/0014`–`0017`, `API_CONTRACTS.md` and the workspace `progress.md`.
+
+- **Media picker, browser-verified (local):** library lists the 2 archived generated images with
+  signed thumbnails; pick order, remove/re-add and "Already added" work; a send (worker offline, then
+  Stop — no provider call) persisted `MessageAttachment` rows in the picked order; reload shows them.
+  Fixed: unnamed generated items had identical labels (now include creation time). Mobile layout not
+  visually verified (CDP viewport emulation rendered blank).
+- **Deployment: blocked.** Vercel CLI token invalid (owner login required); runbook in `DEPLOYMENT.md`.
+  Trigger.dev production deploy deliberately held until the backend and prod env vars exist.
+- **Local API smoke (substitute for production smoke):** health OK; protected routes 401 without or
+  with a bad token; CORS allows only `FRONTEND_ORIGIN`.
+- **Public API + webhooks:** `POST /api/v1/completions`, `GET /chats/{id}/runs/{runId}`, webhook
+  endpoints (`/api/v1/webhooks`), signed lifecycle events (`agent.started|completed|failed`,
+  `tool.completed`) via a durable `deliver-webhook` task (6 attempts, permanent 4xx not retried,
+  per-event idempotency). Migration `20261103220000_webhook_endpoint` (additive).
+  Fixed a pre-existing bug: a reused Idempotency-Key could return another user's dispatch (now 409).
+  Not done: direct (model-free) Magica tool execution endpoint.
+- **Docs:** Mintlify site in `mintlify/` (guides + OpenAPI generated from Zod via
+  `scripts/generate-openapi.ts`); READMEs rewritten. Not hosted (needs Mintlify account).
+- **Load:** `LOAD_TEST.md` — correctness held to 100 concurrent; throughput pool-bound (~4.2
+  admissions/s, ~1.8 turns/s per process); pool saturation now returns 503 ServiceBusy.
+- **Merge videos:** backend verified by existing tests; added inline video rendering in the UI.
+  **Blocked for production use:** admission is `ADMISSION_POLICY_REQUIRED` until a charging rule
+  for duration-billed merges is chosen (open product decision).
+- **Frontend:** chat search box (debounced, keeps previous results while loading).
+
+## Sprint log — 2026-11-03 (final development sprint)
+- **Direct Magica tool execution** (`POST /api/v1/chats/{chatId}/tool-runs`): required by the
+  assessment's REST list. Reuses admission (`sendTurn`), the `run-agent-turn` task (`directTool`
+  payload → one `runOneToolCall`, no model), credit admission/settlement, recovery and webhooks.
+- **Merge Videos**: implementation verified (validation, order, transitions, persistence, archival,
+  inline playback). Admission stays blocked; decision options recorded in `decisions/0018`.
+- **Mobile**: fixed the chat-list sheet closing on any click (search was unusable on mobile).
+- **Load**: pool size configurable (`DATABASE_POOL_MAX`); 200 concurrent admissions and turns pass
+  at pool 40 (`LOAD_TEST.md`).
+- **Runbook** rewritten as "Demo Deployment Runbook — Vercel + Trigger.dev"; demo script `DEMO.md`.
+- Observed (not caused by this sprint): a real `generate_image` run in the owner's main chat at
+  2026-11-02 18:48 UTC, charged once (273,936); ledger consistent (balance = ledger sum).
+
+## Fix — media URLs in assistant prose (2026-11-03)
+**Root cause.** `providers/conversation-context.ts` gives the model, as tool inputs, an
+"Attached/Generated files (in order):" list of one-hour signed B2 URLs appended to each past
+message. On 2026-11-03 03:02 the routed free model (`cohere/north-mini-code:free`) made **no tool
+call**, claimed it had generated an image, invented a `g.tlcdn.com` URL (present in no tool output)
+and copied the list format with a signed B2 URL (incl. `X-Amz-Credential` and `X-Amz-Signature`)
+into its reply. Separately, 5 earlier replies pasted real Magica result URLs into prose. Nothing
+filtered assistant prose, so both reached the UI as text. No charge, no tool invocation, no
+attachment for that turn; the image path itself was not regressed (real generations still rendered).
+
+**Fix (no DB rewrite, no settlement change, no new endpoint or dependency).**
+- `contracts/assistant-text.ts` (synced to the frontend): `stripMediaReferences` removes the context
+  file lists, Magica/B2 media URLs and any presigned (X-Amz) URL — bare, markdown or angle-bracketed —
+  and drops lines left empty; unrelated links and unaffected text are returned byte-for-byte.
+- Applied to assistant `text` blocks in `services/message.ts` (API responses; stored rows untouched)
+  and to past assistant replies in `conversation-context.ts` (so a leaked reply is not fed back).
+  User text is never altered.
+- `skills/prompt.ts`: `MEDIA_REPLY_RULES` — never write media URLs or repeat the file lists; only
+  claim media you generated with a successful tool call this turn.
+- Webhook payloads carry no text (checked).
+- Tests: `assistant-text.test.ts` (7, exact observed shape), `message.test.ts` (+1: API strips,
+  user text unchanged, stored row unchanged), `conversation-context.test.ts` (+1), `prompt.test.ts` (+1).
+- Live check (read-only service call on the affected chat): API assistant text has no X-Amz, no
+  provider URL, no file list; the stored row still contains the original text.
+- Limitation: the model can still *claim* a generation it did not perform; the prompt rule reduces
+  this, and the UI never renders an image without a successful tool result.
+
+## Run status UX + tool latency investigation (2026-11-03)
+**Latency (persisted timestamps + worker log; the user's real generations, 5 completed `generate_image`):**
+
+| Stage | Observed |
+|---|---|
+| Admission → Trigger.dev run started (local dev worker) | 8.5–10.2 s (consistently ~8.6 s) |
+| Run start → tool call (model rounds via OpenRouter Free) | 7.5–40 s; every one of the 5 included a rejected first call with `size: "Auto"` (`EXPLICIT_SIZE_REQUIRED`), i.e. an extra model round |
+| Tool call: Magica submission + provider generation + 10 s durable polling | **166.7–180.9 s (~80% of the turn)** |
+| Tool done → credits settled (inline) | ~4.5 s |
+| Tool done → generated asset archived (separate task) | ~3–7 s |
+| Tool done → run COMPLETED | ~4–6 s |
+| Total | 215.8–242 s |
+
+Polling adds at most one 10 s interval (avg ~5 s) on top of Magica's own time; provider timestamps
+aren't exposed, so Magica's exact share can't be separated further. GPT Image 2 at "High" quality,
+1024×1024 is the dominant cost. Settlement/archival are a few seconds and never fail the image.
+Not changed: no timeouts, polling interval, retries or credit logic. Worth considering later (not
+done): stop the model choosing `size: "Auto"` (tool description/default), saving one model round.
+
+**Change:** new run event `tool_progress` (`phase: "provider_waiting"`), emitted best-effort once a
+Magica run id is persisted (`ToolExecutionContext.onProgress`; a failed publish is logged and
+swallowed — it can't fail or duplicate a started billable run). Tests in `magica-tools.test.ts` (+3).
+
+## Credit usage as operation metadata (2026-11-03)
+**Root cause of the duplicate:** usage was already shown by the app under each result, but nothing told
+the model not to report it, and nothing filtered its prose — so "It used 273936 credits." appeared too.
+Separately, a tool_result block records `creditsCharged` only when the turn writes it; an invocation
+settled afterwards (recovery/durable settlement) kept `null` in its block, so its usage never showed
+(1 such real block in the DB).
+- `contracts/assistant-text.ts`: `stripCreditStatements` (narrow: credit amount + past-tense
+  used/consumed/charged/spent/deducted/billed/took, "<subject> cost N credits", or a "Credits used: N"
+  label; parentheticals lose only the parenthesis; prices, future costs, balances and other numbers
+  kept; streaming holds back an unfinished sentence heading for one) and `sanitizeAssistantText`
+  (media URLs + credit statements) — used by the API mapping and model context.
+- `services/message.ts`: tool_result blocks with `creditsCharged: null` get the settled amount from
+  their own message's ToolInvocation (presentation only; nothing written; settlement untouched).
+- `skills/prompt.ts`: "Never state how many credits a tool used".
+- Tests: `credit-statements.test.ts` (20), `message.test.ts` (+1), `prompt.test.ts` (+1 assertion).
+
+
+## Merge Videos admission enabled (2026-11-03)
+Decision 0018 accepted (D1 1.3×, D2 no live merge, D3 300 s cap, D4 one Transloadit test, D5 uploads only).
+- D4 evidence: one 3.0 s test MP4 → `durationSeconds: 3` persisted server-side (LIVE_VERIFICATION.md).
+- `services/merge-admission.ts`: `resolveMergeSources` (own READY uploaded videos only, by B2 storage key
+  or exact Transloadit URL; measured durations; duplicates counted; cap) and `mergeAdmissionCredits`
+  (exact integer formula). `lib/b2.ts#storageKeyFromUrl` (pure parsing). `tools/magica-tools.ts`: the
+  admission hook receives the execution context and may be async; merge uses the policy; image tools
+  unchanged. Settlement, ledger, recovery, schema and frontend untouched; no migration.
+- Tests: `merge-admission.test.ts` (19, DB-backed, Magica/OpenRouter mocked); `credit-admission.test.ts`
+  merge case now expects `MERGE_SOURCE_UNSUPPORTED`; `magica-tools.test.ts` mocks the source lookup for
+  its placeholder-URL execution tests.

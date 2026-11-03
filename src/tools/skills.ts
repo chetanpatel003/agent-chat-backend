@@ -7,6 +7,7 @@ import { resolveApprovedAsset } from "@/skills/paths";
 import type { SkillRegistry } from "@/skills/types";
 import { PRODUCTION_SKILL_REGISTRY } from "@/skills/registry";
 import type { ToolDefinition } from "./types";
+import { TOOL_DISPLAY } from "./display";
 
 // Checked empirically with a standalone diagnostic script against the
 // real Neon database, not assumed from the decisions/0009 precedent:
@@ -111,6 +112,7 @@ export function createLoadSkillTool(
 ): ToolDefinition<z.infer<typeof LoadSkillInputSchema>, LoadSkillOutput> {
   return {
     name: "load_skill",
+    display: TOOL_DISPLAY.load_skill,
     description:
       "Load a registered skill's full instructions by its exact name. Call this only when the skill is relevant to the user's current request.",
     inputSchema: LoadSkillInputSchema,
@@ -163,6 +165,7 @@ export function createReadSkillAssetTool(
 ): ToolDefinition<z.infer<typeof ReadSkillAssetInputSchema>, ReadSkillAssetOutput> {
   return {
     name: "read_skill_asset",
+    display: TOOL_DISPLAY.read_skill_asset,
     description:
       "Read one approved supporting file (e.g. a guide referenced by a loaded skill's instructions) by its relative path. The skill must already be loaded via load_skill.",
     inputSchema: ReadSkillAssetInputSchema,

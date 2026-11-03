@@ -1716,6 +1716,11 @@
                                         "toolName": {
                                           "type": "string"
                                         },
+                                        "displayName": {
+                                          "type": "string",
+                                          "minLength": 1,
+                                          "maxLength": 60
+                                        },
                                         "status": {
                                           "type": "string",
                                           "enum": [
@@ -2052,6 +2057,19 @@
                                   }
                                 ]
                               },
+                              "runQueueMs": {
+                                "default": null,
+                                "anyOf": [
+                                  {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "error": {
                                 "anyOf": [
                                   {
@@ -2091,6 +2109,7 @@
                               "attachments",
                               "thinkingMs",
                               "runDurationMs",
+                              "runQueueMs",
                               "error",
                               "createdAt"
                             ],

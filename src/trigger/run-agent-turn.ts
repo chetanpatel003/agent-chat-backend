@@ -25,6 +25,8 @@ import { buildConversationContext } from "@/providers/conversation-context";
 import { PRODUCTION_TOOL_REGISTRY, toOpenRouterTools } from "@/tools/registry";
 import { ProviderRunFailedError, ToolExecutionError, type ToolRegistry } from "@/tools/types";
 import type { ContentBlock } from "@/contracts/message";
+import type { ToolProgressPhase } from "@/contracts/run-event";
+import { toolDisplay } from "@/tools/display";
 import { MagicaPollInconclusiveError } from "@/providers/magica";
 import { PRODUCTION_SKILL_REGISTRY, listSkillMetadata } from "@/skills/registry";
 import { buildSkillSystemPrompt } from "@/skills/prompt";
@@ -439,7 +441,18 @@ async function runOneToolCall(params: {
       status: "RUNNING",
     },
   });
-  await emit({ type: "tool_started", toolInvocationId: invocation.id, toolName: tool.name });
+  await emit({ type: "tool_started", toolInvocationId: invocation.id, toolName: tool.name, display: toolDisplay(tool.name, tool.display) });
+  // Best-effort lifecycle labels for the UI: a failed publish must never
+  // fail (or make ambiguous) a tool call. Emitted when each phase begins.
+  const reportPhase = (phase: ToolProgressPhase) =>
+    emit({ type: "tool_progress", toolInvocationId: invocation.id, toolName: tool.name, phase }).catch((error: unknown) => {
+      console.warn("tool_progress publish failed", {
+        agentRunId,
+        toolInvocationId: invocation.id,
+        phase,
+        error: error instanceof Error ? error.name : "UnknownError",
+      });
+    });
 
   // Execution and persistence are deliberately separated (Phase 3.1
   // hardening): this block ONLY decides the tool's own outcome — it
@@ -467,14 +480,7 @@ async function runOneToolCall(params: {
       invocationId: invocation.id,
       // Best-effort UI progress: a failed publish must never fail (or
       // make ambiguous) a provider run that has already started.
-      onProgress: (phase) =>
-        emit({ type: "tool_progress", toolInvocationId: invocation.id, toolName: tool.name, phase }).catch((error: unknown) => {
-          console.warn("tool_progress publish failed", {
-            agentRunId,
-            toolInvocationId: invocation.id,
-            error: error instanceof Error ? error.name : "UnknownError",
-          });
-        }),
+      onProgress: reportPhase,
     });
     const parsedOutput = tool.outputSchema.safeParse(rawOutput);
     outcome = parsedOutput.success
@@ -503,8 +509,11 @@ async function runOneToolCall(params: {
     };
   }
   const durationMs = Date.now() - startedAt;
+  // The tool has returned (its own duration is measured above, unchanged).
+  await reportPhase("receiving");
 
   if (outcome.ok) {
+    await reportPhase("saving");
     const completed = await prisma.toolInvocation.update({
       where: { id: invocation.id },
       data: { status: "COMPLETED", output: outcome.output as Prisma.InputJsonValue, durationMs },

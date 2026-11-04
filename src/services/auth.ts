@@ -15,8 +15,8 @@ export type AuthContext = {
 };
 
 /** Starting balance for every newly signed-up user, in raw integer credits
- * (displayed as "3M"). Granted once, at local user creation. */
-export const SIGNUP_GRANT_CREDITS = BigInt(3_000_000);
+ * (displayed as "30M"). Granted once, at local user creation. */
+export const SIGNUP_GRANT_CREDITS = BigInt(30_000_000);
 
 export const signupGrantIdempotencyKey = (clerkUserId: string) => `signup-grant:${clerkUserId}`;
 

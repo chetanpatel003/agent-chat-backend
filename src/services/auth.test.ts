@@ -129,8 +129,8 @@ describe("authenticate — local user resolution", () => {
     expect((await prisma.creditAccount.findUniqueOrThrow({ where: { userId: a.userId } })).balance).toBe(SIGNUP_GRANT_CREDITS);
   });
 
-  it("a newly signed-up user starts with 3,000,000 credits and one GRANT ledger entry; later sign-ins grant nothing", async () => {
-    expect(SIGNUP_GRANT_CREDITS).toBe(BigInt(3_000_000));
+  it("a newly signed-up user starts with 30,000,000 credits and one GRANT ledger entry; later sign-ins grant nothing", async () => {
+    expect(SIGNUP_GRANT_CREDITS).toBe(BigInt(30_000_000));
     const clerkUserId = `test_ckpt1.2_${randomUUID()}`;
     mockVerifyToken.mockResolvedValue({ sub: clerkUserId } as never);
     mockGetUser.mockResolvedValue(mockClerkProfile(clerkUserId, "grant@example.com"));
@@ -140,10 +140,10 @@ describe("authenticate — local user resolution", () => {
     await authenticate(makeRequest({ Authorization: "Bearer g2" }));
 
     const account = await prisma.creditAccount.findUniqueOrThrow({ where: { userId: ctx.userId } });
-    expect(account.balance).toBe(BigInt(3_000_000));
+    expect(account.balance).toBe(BigInt(30_000_000));
     const ledger = await prisma.creditLedger.findMany({ where: { userId: ctx.userId } });
     expect(ledger).toHaveLength(1);
-    expect(ledger[0]).toMatchObject({ type: "GRANT", amount: BigInt(3_000_000), balanceAfter: BigInt(3_000_000), toolInvocationId: null });
+    expect(ledger[0]).toMatchObject({ type: "GRANT", amount: BigInt(30_000_000), balanceAfter: BigInt(30_000_000), toolInvocationId: null });
   });
 
   it("ignores any identity the caller tries to supply outside the verified token", async () => {
